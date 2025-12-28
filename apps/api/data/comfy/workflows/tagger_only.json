@@ -1,0 +1,30 @@
+{
+  "1": {
+    "inputs": {
+      "image": "135218647_p40_master1200.jpg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "画像を読み込む"
+    }
+  },
+  "2": {
+    "inputs": {
+      "model": "wd-v1-4-moat-tagger-v2",
+      "threshold": 0.35,
+      "character_threshold": 0.85,
+      "replace_underscore": false,
+      "trailing_comma": false,
+      "exclude_tags": "",
+      "tags": "1girl, breasts, blush, short_hair, large_breasts, black_hair, 1boy, hair_between_eyes, nipples, hetero, sweat, censored, pussy, solo_focus, tears, spread_legs, cum, apron, mosaic_censoring, maid, maid_headdress, pubic_hair, cum_in_pussy, female_pubic_hair, trembling, crying, breasts_out, maid_apron, after_sex, cumdrip, crying_with_eyes_open, after_vaginal",
+      "image": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "WD14Tagger|pysssss",
+    "_meta": {
+      "title": "WD14 Tagger 🐍"
+    }
+  }
+}

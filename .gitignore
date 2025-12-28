@@ -1,0 +1,37 @@
+# Node
+node_modules/
+dist/
+build/
+*.log
+
+# Env
+.env
+.env.*.local
+
+# OS/Editor
+.DS_Store
+.vscode/
+# API data (runtime)
+apps/api/data/whisper/**
+apps/api/data/**/temp/**
+apps/api/data/media/**
+
+# Repository-local data roots (defense in depth)
+.local-data/
+.muse-data/
+local-data/
+muse-data/
+
+# Media artifacts
+**/*.wav
+**/*.mp3
+**/*.flac
+**/*.m4a
+**/*.png
+**/*.jpg
+**/*.jpeg
+**/*.webp
+**/*.mp4
+**/*.webm
+**/*.mov
+**/*.zip
