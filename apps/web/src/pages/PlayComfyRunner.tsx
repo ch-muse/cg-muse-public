@@ -1560,6 +1560,7 @@ export default function PlayComfyRunnerPage() {
           <div className="mt-4 grid gap-4 md:grid-cols-2">
             <PromptComposer
               label="Positive"
+              target="positive"
               value={positive}
               onChange={setPositive}
               onClear={() => setPositive("")}
@@ -1567,6 +1568,7 @@ export default function PlayComfyRunnerPage() {
             />
             <PromptComposer
               label="Negative"
+              target="negative"
               value={negative}
               onChange={setNegative}
               onClear={() => setNegative("")}

@@ -5,13 +5,16 @@ const FETCH_TIMEOUT_MS = 12000;
 const DEBUG_TEXT_LIMIT = 600;
 const IMPORT_BATCH_SIZE = 500;
 
-type TabKey = "dictionary" | "translations";
+type TabKey = "dictionary" | "translations" | "groups" | "conflicts" | "templates";
 
 type DictionaryItem = {
   tag: string;
   type?: string | null;
   count?: number | null;
   aliases: string[];
+  tag_type?: number | null;
+  post_count?: number | null;
+  ja?: string | null;
   created_at?: string;
   updated_at?: string;
 };
@@ -21,6 +24,34 @@ type TranslationItem = {
   ja: string;
   source: string;
   seen_count?: number | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
+type PromptGroupItem = {
+  id: number;
+  label: string;
+  sort_order: number;
+  filter: Record<string, unknown> | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
+type PromptConflictItem = {
+  id: number;
+  a: string;
+  b: string;
+  severity: string;
+  message?: string | null;
+  created_at?: string;
+};
+
+type PromptTemplateItem = {
+  id: number;
+  name: string;
+  target: "positive" | "negative" | "both";
+  tokens: string[];
+  sort_order: number;
   created_at?: string;
   updated_at?: string;
 };
@@ -56,6 +87,26 @@ type TranslationForm = {
   source: string;
 };
 
+type PromptGroupForm = {
+  label: string;
+  sortOrder: string;
+  filter: string;
+};
+
+type PromptConflictForm = {
+  a: string;
+  b: string;
+  severity: string;
+  message: string;
+};
+
+type PromptTemplateForm = {
+  name: string;
+  target: "positive" | "negative" | "both";
+  sortOrder: string;
+  tokens: string;
+};
+
 const emptyDebug: DebugState = {
   phase: "idle",
   lastUpdatedAt: null,
@@ -82,6 +133,26 @@ const parseAliases = (value: string) =>
     .split(/[|,]/g)
     .map((item) => item.trim())
     .filter((item) => item.length > 0);
+
+const parseTokensInput = (value: string) =>
+  value
+    .split(/[,\n\r\t]+/g)
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+
+const parseJsonInput = (value: string) => {
+  const trimmed = value.trim();
+  if (!trimmed) return { ok: true, value: null };
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (!parsed || typeof parsed !== "object") {
+      return { ok: false, message: "JSON must be an object" };
+    }
+    return { ok: true, value: parsed as Record<string, unknown> };
+  } catch {
+    return { ok: false, message: "Invalid JSON" };
+  }
+};
 
 const chunkArray = <T,>(items: T[], size: number) => {
   const chunks: T[][] = [];
@@ -123,17 +194,52 @@ export default function InternalsDictionaryPage() {
   const [translationSearch, setTranslationSearch] = useState("");
   const translationQuery = useDebouncedValue(translationSearch);
 
+  const [promptGroups, setPromptGroups] = useState<PromptGroupItem[]>([]);
+  const [promptGroupEditingId, setPromptGroupEditingId] = useState<number | null>(null);
+  const [promptGroupForm, setPromptGroupForm] = useState<PromptGroupForm>({
+    label: "",
+    sortOrder: "0",
+    filter: ""
+  });
+
+  const [promptConflicts, setPromptConflicts] = useState<PromptConflictItem[]>([]);
+  const [promptConflictEditingId, setPromptConflictEditingId] = useState<number | null>(null);
+  const [promptConflictForm, setPromptConflictForm] = useState<PromptConflictForm>({
+    a: "",
+    b: "",
+    severity: "warn",
+    message: ""
+  });
+
+  const [promptTemplates, setPromptTemplates] = useState<PromptTemplateItem[]>([]);
+  const [promptTemplateEditingId, setPromptTemplateEditingId] = useState<number | null>(null);
+  const [promptTemplateForm, setPromptTemplateForm] = useState<PromptTemplateForm>({
+    name: "",
+    target: "positive",
+    sortOrder: "0",
+    tokens: ""
+  });
+
   const [debugState, setDebugState] = useState<Record<TabKey, DebugState>>({
     dictionary: emptyDebug,
-    translations: emptyDebug
+    translations: emptyDebug,
+    groups: emptyDebug,
+    conflicts: emptyDebug,
+    templates: emptyDebug
   });
   const [messageState, setMessageState] = useState<Record<TabKey, string | null>>({
     dictionary: null,
-    translations: null
+    translations: null,
+    groups: null,
+    conflicts: null,
+    templates: null
   });
   const [importState, setImportState] = useState<Record<TabKey, ImportState>>({
     dictionary: emptyImport,
-    translations: emptyImport
+    translations: emptyImport,
+    groups: emptyImport,
+    conflicts: emptyImport,
+    templates: emptyImport
   });
 
   const [modalOpen, setModalOpen] = useState(false);
@@ -170,6 +276,13 @@ export default function InternalsDictionaryPage() {
   const translationActionInFlightRef = useRef(false);
   const translationActionRequestIdRef = useRef(0);
   const translationActionAbortRef = useRef<AbortController | null>(null);
+
+  const promptGroupListInFlightRef = useRef(false);
+  const promptConflictListInFlightRef = useRef(false);
+  const promptTemplateListInFlightRef = useRef(false);
+  const promptGroupActionInFlightRef = useRef(false);
+  const promptConflictActionInFlightRef = useRef(false);
+  const promptTemplateActionInFlightRef = useRef(false);
 
   const dictionaryImportInFlightRef = useRef(false);
   const dictionaryImportRequestIdRef = useRef(0);
@@ -412,6 +525,239 @@ export default function InternalsDictionaryPage() {
     }
   }, [translationLimit, translationPage, translationQuery]);
 
+  const fetchPromptGroups = useCallback(async () => {
+    if (promptGroupListInFlightRef.current) return;
+    promptGroupListInFlightRef.current = true;
+    setDebugState((prev) => ({
+      ...prev,
+      groups: { ...prev.groups, phase: "fetching", lastError: null, lastHttpStatus: null, lastRawText: null }
+    }));
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/prompt/tag-groups`, { cache: "no-store" });
+      const text = await response.text();
+      setDebugState((prev) => ({
+        ...prev,
+        groups: { ...prev.groups, lastHttpStatus: response.status, lastRawText: text ? truncateText(text) : null }
+      }));
+      if (!response.ok) {
+        setDebugState((prev) => ({
+          ...prev,
+          groups: { ...prev.groups, phase: "error", lastError: `HTTP ${response.status}` }
+        }));
+        return;
+      }
+      let payload: any = null;
+      try {
+        payload = text ? JSON.parse(text) : null;
+      } catch {
+        setDebugState((prev) => ({
+          ...prev,
+          groups: { ...prev.groups, phase: "error", lastError: "Invalid response" }
+        }));
+        return;
+      }
+      if (!payload || payload.ok !== true || !payload.data || !Array.isArray(payload.data.groups)) {
+        setDebugState((prev) => ({
+          ...prev,
+          groups: { ...prev.groups, phase: "error", lastError: payload?.error?.message || "Invalid response" }
+        }));
+        return;
+      }
+      const items = (payload.data.groups as any[])
+        .map((row) => {
+          const id = Number(row?.id);
+          if (!Number.isFinite(id)) return null;
+          const label = typeof row?.label === "string" ? row.label : "";
+          const sortOrder = Number(row?.sort_order ?? row?.sortOrder ?? 0);
+          return {
+            id,
+            label,
+            sort_order: Number.isFinite(sortOrder) ? sortOrder : 0,
+            filter: row?.filter && typeof row.filter === "object" ? row.filter : row?.filter ? null : null,
+            created_at: row?.created_at,
+            updated_at: row?.updated_at
+          } satisfies PromptGroupItem;
+        })
+        .filter((item): item is PromptGroupItem => item !== null)
+        .sort((a, b) => a.sort_order - b.sort_order || a.id - b.id);
+      setPromptGroups(items);
+      setDebugState((prev) => ({
+        ...prev,
+        groups: { ...prev.groups, phase: "success", lastUpdatedAt: new Date().toISOString() }
+      }));
+    } catch (err) {
+      const message =
+        err instanceof Error && err.name === "AbortError"
+          ? "timeout"
+          : err instanceof Error
+            ? err.message
+            : "fetch failed";
+      setDebugState((prev) => ({
+        ...prev,
+        groups: { ...prev.groups, phase: "error", lastError: message }
+      }));
+    } finally {
+      promptGroupListInFlightRef.current = false;
+    }
+  }, []);
+
+  const fetchPromptConflicts = useCallback(async () => {
+    if (promptConflictListInFlightRef.current) return;
+    promptConflictListInFlightRef.current = true;
+    setDebugState((prev) => ({
+      ...prev,
+      conflicts: { ...prev.conflicts, phase: "fetching", lastError: null, lastHttpStatus: null, lastRawText: null }
+    }));
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/prompt/conflicts`, { cache: "no-store" });
+      const text = await response.text();
+      setDebugState((prev) => ({
+        ...prev,
+        conflicts: { ...prev.conflicts, lastHttpStatus: response.status, lastRawText: text ? truncateText(text) : null }
+      }));
+      if (!response.ok) {
+        setDebugState((prev) => ({
+          ...prev,
+          conflicts: { ...prev.conflicts, phase: "error", lastError: `HTTP ${response.status}` }
+        }));
+        return;
+      }
+      let payload: any = null;
+      try {
+        payload = text ? JSON.parse(text) : null;
+      } catch {
+        setDebugState((prev) => ({
+          ...prev,
+          conflicts: { ...prev.conflicts, phase: "error", lastError: "Invalid response" }
+        }));
+        return;
+      }
+      if (!payload || payload.ok !== true || !payload.data || !Array.isArray(payload.data.conflicts)) {
+        setDebugState((prev) => ({
+          ...prev,
+          conflicts: { ...prev.conflicts, phase: "error", lastError: payload?.error?.message || "Invalid response" }
+        }));
+        return;
+      }
+      const items = (payload.data.conflicts as any[])
+        .map((row) => {
+          const id = Number(row?.id);
+          const a = typeof row?.a === "string" ? row.a : "";
+          const b = typeof row?.b === "string" ? row.b : "";
+          if (!Number.isFinite(id) || !a || !b) return null;
+          return {
+            id,
+            a,
+            b,
+            severity: typeof row?.severity === "string" ? row.severity : "warn",
+            message: typeof row?.message === "string" ? row.message : null,
+            created_at: row?.created_at
+          } satisfies PromptConflictItem;
+        })
+        .filter((item): item is PromptConflictItem => item !== null);
+      setPromptConflicts(items);
+      setDebugState((prev) => ({
+        ...prev,
+        conflicts: { ...prev.conflicts, phase: "success", lastUpdatedAt: new Date().toISOString() }
+      }));
+    } catch (err) {
+      const message =
+        err instanceof Error && err.name === "AbortError"
+          ? "timeout"
+          : err instanceof Error
+            ? err.message
+            : "fetch failed";
+      setDebugState((prev) => ({
+        ...prev,
+        conflicts: { ...prev.conflicts, phase: "error", lastError: message }
+      }));
+    } finally {
+      promptConflictListInFlightRef.current = false;
+    }
+  }, []);
+
+  const fetchPromptTemplates = useCallback(async () => {
+    if (promptTemplateListInFlightRef.current) return;
+    promptTemplateListInFlightRef.current = true;
+    setDebugState((prev) => ({
+      ...prev,
+      templates: { ...prev.templates, phase: "fetching", lastError: null, lastHttpStatus: null, lastRawText: null }
+    }));
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/prompt/templates`, { cache: "no-store" });
+      const text = await response.text();
+      setDebugState((prev) => ({
+        ...prev,
+        templates: { ...prev.templates, lastHttpStatus: response.status, lastRawText: text ? truncateText(text) : null }
+      }));
+      if (!response.ok) {
+        setDebugState((prev) => ({
+          ...prev,
+          templates: { ...prev.templates, phase: "error", lastError: `HTTP ${response.status}` }
+        }));
+        return;
+      }
+      let payload: any = null;
+      try {
+        payload = text ? JSON.parse(text) : null;
+      } catch {
+        setDebugState((prev) => ({
+          ...prev,
+          templates: { ...prev.templates, phase: "error", lastError: "Invalid response" }
+        }));
+        return;
+      }
+      if (!payload || payload.ok !== true || !payload.data || !Array.isArray(payload.data.templates)) {
+        setDebugState((prev) => ({
+          ...prev,
+          templates: { ...prev.templates, phase: "error", lastError: payload?.error?.message || "Invalid response" }
+        }));
+        return;
+      }
+      const items = (payload.data.templates as any[])
+        .map((row) => {
+          const id = Number(row?.id);
+          const name = typeof row?.name === "string" ? row.name : "";
+          const target = row?.target;
+          if (!Number.isFinite(id) || !name) return null;
+          if (target !== "positive" && target !== "negative" && target !== "both") return null;
+          const sortOrder = Number(row?.sort_order ?? row?.sortOrder ?? 0);
+          const tokens = Array.isArray(row?.tokens)
+            ? (row.tokens as unknown[]).filter((item): item is string => typeof item === "string")
+            : [];
+          return {
+            id,
+            name,
+            target,
+            sort_order: Number.isFinite(sortOrder) ? sortOrder : 0,
+            tokens,
+            created_at: row?.created_at,
+            updated_at: row?.updated_at
+          } satisfies PromptTemplateItem;
+        })
+        .filter((item): item is PromptTemplateItem => item !== null)
+        .sort((a, b) => a.sort_order - b.sort_order || a.id - b.id);
+      setPromptTemplates(items);
+      setDebugState((prev) => ({
+        ...prev,
+        templates: { ...prev.templates, phase: "success", lastUpdatedAt: new Date().toISOString() }
+      }));
+    } catch (err) {
+      const message =
+        err instanceof Error && err.name === "AbortError"
+          ? "timeout"
+          : err instanceof Error
+            ? err.message
+            : "fetch failed";
+      setDebugState((prev) => ({
+        ...prev,
+        templates: { ...prev.templates, phase: "error", lastError: message }
+      }));
+    } finally {
+      promptTemplateListInFlightRef.current = false;
+    }
+  }, []);
+
   useEffect(() => {
     if (activeTab !== "dictionary") return;
     fetchDictionaryPage();
@@ -421,6 +767,21 @@ export default function InternalsDictionaryPage() {
     if (activeTab !== "translations") return;
     fetchTranslationPage();
   }, [activeTab, fetchTranslationPage]);
+
+  useEffect(() => {
+    if (activeTab !== "groups") return;
+    fetchPromptGroups();
+  }, [activeTab, fetchPromptGroups]);
+
+  useEffect(() => {
+    if (activeTab !== "conflicts") return;
+    fetchPromptConflicts();
+  }, [activeTab, fetchPromptConflicts]);
+
+  useEffect(() => {
+    if (activeTab !== "templates") return;
+    fetchPromptTemplates();
+  }, [activeTab, fetchPromptTemplates]);
 
   const dictionaryPageCount = dictionaryTotal ? Math.max(1, Math.ceil(dictionaryTotal / dictionaryLimit)) : null;
   const translationPageCount = translationTotal ? Math.max(1, Math.ceil(translationTotal / translationLimit)) : null;
@@ -700,6 +1061,340 @@ export default function InternalsDictionaryPage() {
     },
     [fetchTranslationPage]
   );
+
+  const resetPromptGroupForm = useCallback(() => {
+    setPromptGroupEditingId(null);
+    setPromptGroupForm({ label: "", sortOrder: "0", filter: "" });
+  }, []);
+
+  const handleEditPromptGroup = useCallback((entry: PromptGroupItem) => {
+    setPromptGroupEditingId(entry.id);
+    setPromptGroupForm({
+      label: entry.label,
+      sortOrder: String(entry.sort_order ?? 0),
+      filter: entry.filter ? JSON.stringify(entry.filter) : ""
+    });
+  }, []);
+
+  const handleSavePromptGroup = useCallback(async () => {
+    if (promptGroupActionInFlightRef.current) return;
+    const label = promptGroupForm.label.trim();
+    if (!label) {
+      setMessageState((prev) => ({ ...prev, groups: "label is required" }));
+      return;
+    }
+    const sortOrderValue = Number(promptGroupForm.sortOrder);
+    const sortOrder = Number.isFinite(sortOrderValue) ? Math.trunc(sortOrderValue) : 0;
+    if (!Number.isFinite(sortOrderValue)) {
+      setMessageState((prev) => ({ ...prev, groups: "sort_order must be a number" }));
+      return;
+    }
+    const filterResult = parseJsonInput(promptGroupForm.filter);
+    if (!filterResult.ok) {
+      setMessageState((prev) => ({ ...prev, groups: filterResult.message }));
+      return;
+    }
+
+    promptGroupActionInFlightRef.current = true;
+    try {
+      const body: Record<string, unknown> = { label, sortOrder };
+      if (promptGroupForm.filter.trim().length > 0) {
+        body.filter = filterResult.value;
+      }
+      const response = await fetch(
+        `${API_BASE_URL}/api/prompt/tag-groups${promptGroupEditingId ? `/${promptGroupEditingId}` : ""}`,
+        {
+          method: promptGroupEditingId ? "PATCH" : "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          cache: "no-store"
+        }
+      );
+      const text = await response.text();
+      if (!response.ok) {
+        setMessageState((prev) => ({ ...prev, groups: `HTTP ${response.status}` }));
+        return;
+      }
+      let payload: any = null;
+      try {
+        payload = text ? JSON.parse(text) : null;
+      } catch {
+        setMessageState((prev) => ({ ...prev, groups: "Invalid response" }));
+        return;
+      }
+      if (!payload || payload.ok !== true) {
+        setMessageState((prev) => ({ ...prev, groups: payload?.error?.message || "Save failed" }));
+        return;
+      }
+      setMessageState((prev) => ({ ...prev, groups: promptGroupEditingId ? "Updated" : "Created" }));
+      resetPromptGroupForm();
+      fetchPromptGroups();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "save failed";
+      setMessageState((prev) => ({ ...prev, groups: message }));
+    } finally {
+      promptGroupActionInFlightRef.current = false;
+    }
+  }, [fetchPromptGroups, promptGroupEditingId, promptGroupForm, resetPromptGroupForm]);
+
+  const handleDeletePromptGroup = useCallback(
+    async (id: number) => {
+      if (promptGroupActionInFlightRef.current) return;
+      if (!window.confirm("Delete this group?")) return;
+      promptGroupActionInFlightRef.current = true;
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/prompt/tag-groups/${id}`, {
+          method: "DELETE",
+          cache: "no-store"
+        });
+        const text = await response.text();
+        if (!response.ok) {
+          setMessageState((prev) => ({ ...prev, groups: `HTTP ${response.status}` }));
+          return;
+        }
+        let payload: any = null;
+        try {
+          payload = text ? JSON.parse(text) : null;
+        } catch {
+          setMessageState((prev) => ({ ...prev, groups: "Invalid response" }));
+          return;
+        }
+        if (!payload || payload.ok !== true) {
+          setMessageState((prev) => ({ ...prev, groups: payload?.error?.message || "Delete failed" }));
+          return;
+        }
+        setMessageState((prev) => ({ ...prev, groups: "Deleted" }));
+        fetchPromptGroups();
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "delete failed";
+        setMessageState((prev) => ({ ...prev, groups: message }));
+      } finally {
+        promptGroupActionInFlightRef.current = false;
+      }
+    },
+    [fetchPromptGroups]
+  );
+
+  const resetPromptConflictForm = useCallback(() => {
+    setPromptConflictEditingId(null);
+    setPromptConflictForm({ a: "", b: "", severity: "warn", message: "" });
+  }, []);
+
+  const handleEditPromptConflict = useCallback((entry: PromptConflictItem) => {
+    setPromptConflictEditingId(entry.id);
+    setPromptConflictForm({
+      a: entry.a,
+      b: entry.b,
+      severity: entry.severity || "warn",
+      message: entry.message ?? ""
+    });
+  }, []);
+
+  const handleSavePromptConflict = useCallback(async () => {
+    if (promptConflictActionInFlightRef.current) return;
+    const a = promptConflictForm.a.trim();
+    const b = promptConflictForm.b.trim();
+    if (!a || !b) {
+      setMessageState((prev) => ({ ...prev, conflicts: "a and b are required" }));
+      return;
+    }
+    promptConflictActionInFlightRef.current = true;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/prompt/conflicts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          a,
+          b,
+          severity: promptConflictForm.severity || "warn",
+          message: promptConflictForm.message.trim() || undefined
+        }),
+        cache: "no-store"
+      });
+      const text = await response.text();
+      if (!response.ok) {
+        setMessageState((prev) => ({ ...prev, conflicts: `HTTP ${response.status}` }));
+        return;
+      }
+      let payload: any = null;
+      try {
+        payload = text ? JSON.parse(text) : null;
+      } catch {
+        setMessageState((prev) => ({ ...prev, conflicts: "Invalid response" }));
+        return;
+      }
+      if (!payload || payload.ok !== true) {
+        setMessageState((prev) => ({ ...prev, conflicts: payload?.error?.message || "Save failed" }));
+        return;
+      }
+      if (promptConflictEditingId) {
+        await fetch(`${API_BASE_URL}/api/prompt/conflicts/${promptConflictEditingId}`, {
+          method: "DELETE",
+          cache: "no-store"
+        });
+      }
+      setMessageState((prev) => ({ ...prev, conflicts: promptConflictEditingId ? "Updated" : "Created" }));
+      resetPromptConflictForm();
+      fetchPromptConflicts();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "save failed";
+      setMessageState((prev) => ({ ...prev, conflicts: message }));
+    } finally {
+      promptConflictActionInFlightRef.current = false;
+    }
+  }, [fetchPromptConflicts, promptConflictEditingId, promptConflictForm, resetPromptConflictForm]);
+
+  const handleDeletePromptConflict = useCallback(
+    async (id: number) => {
+      if (promptConflictActionInFlightRef.current) return;
+      if (!window.confirm("Delete this conflict rule?")) return;
+      promptConflictActionInFlightRef.current = true;
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/prompt/conflicts/${id}`, {
+          method: "DELETE",
+          cache: "no-store"
+        });
+        const text = await response.text();
+        if (!response.ok) {
+          setMessageState((prev) => ({ ...prev, conflicts: `HTTP ${response.status}` }));
+          return;
+        }
+        let payload: any = null;
+        try {
+          payload = text ? JSON.parse(text) : null;
+        } catch {
+          setMessageState((prev) => ({ ...prev, conflicts: "Invalid response" }));
+          return;
+        }
+        if (!payload || payload.ok !== true) {
+          setMessageState((prev) => ({ ...prev, conflicts: payload?.error?.message || "Delete failed" }));
+          return;
+        }
+        setMessageState((prev) => ({ ...prev, conflicts: "Deleted" }));
+        fetchPromptConflicts();
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "delete failed";
+        setMessageState((prev) => ({ ...prev, conflicts: message }));
+      } finally {
+        promptConflictActionInFlightRef.current = false;
+      }
+    },
+    [fetchPromptConflicts]
+  );
+
+  const resetPromptTemplateForm = useCallback(() => {
+    setPromptTemplateEditingId(null);
+    setPromptTemplateForm({ name: "", target: "positive", sortOrder: "0", tokens: "" });
+  }, []);
+
+  const handleEditPromptTemplate = useCallback((entry: PromptTemplateItem) => {
+    setPromptTemplateEditingId(entry.id);
+    setPromptTemplateForm({
+      name: entry.name,
+      target: entry.target,
+      sortOrder: String(entry.sort_order ?? 0),
+      tokens: entry.tokens.join(", ")
+    });
+  }, []);
+
+  const handleSavePromptTemplate = useCallback(async () => {
+    if (promptTemplateActionInFlightRef.current) return;
+    const name = promptTemplateForm.name.trim();
+    if (!name) {
+      setMessageState((prev) => ({ ...prev, templates: "name is required" }));
+      return;
+    }
+    const sortOrderValue = Number(promptTemplateForm.sortOrder);
+    const sortOrder = Number.isFinite(sortOrderValue) ? Math.trunc(sortOrderValue) : 0;
+    if (!Number.isFinite(sortOrderValue)) {
+      setMessageState((prev) => ({ ...prev, templates: "sort_order must be a number" }));
+      return;
+    }
+    const tokens = parseTokensInput(promptTemplateForm.tokens);
+    if (tokens.length === 0) {
+      setMessageState((prev) => ({ ...prev, templates: "tokens are required" }));
+      return;
+    }
+    promptTemplateActionInFlightRef.current = true;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/prompt/templates${promptTemplateEditingId ? `/${promptTemplateEditingId}` : ""}`,
+        {
+          method: promptTemplateEditingId ? "PATCH" : "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name,
+            target: promptTemplateForm.target,
+            sortOrder,
+            tokens
+          }),
+          cache: "no-store"
+        }
+      );
+      const text = await response.text();
+      if (!response.ok) {
+        setMessageState((prev) => ({ ...prev, templates: `HTTP ${response.status}` }));
+        return;
+      }
+      let payload: any = null;
+      try {
+        payload = text ? JSON.parse(text) : null;
+      } catch {
+        setMessageState((prev) => ({ ...prev, templates: "Invalid response" }));
+        return;
+      }
+      if (!payload || payload.ok !== true) {
+        setMessageState((prev) => ({ ...prev, templates: payload?.error?.message || "Save failed" }));
+        return;
+      }
+      setMessageState((prev) => ({ ...prev, templates: promptTemplateEditingId ? "Updated" : "Created" }));
+      resetPromptTemplateForm();
+      fetchPromptTemplates();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "save failed";
+      setMessageState((prev) => ({ ...prev, templates: message }));
+    } finally {
+      promptTemplateActionInFlightRef.current = false;
+    }
+  }, [fetchPromptTemplates, promptTemplateEditingId, promptTemplateForm, resetPromptTemplateForm]);
+
+  const handleDeletePromptTemplate = useCallback(
+    async (id: number) => {
+      if (promptTemplateActionInFlightRef.current) return;
+      if (!window.confirm("Delete this template?")) return;
+      promptTemplateActionInFlightRef.current = true;
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/prompt/templates/${id}`, {
+          method: "DELETE",
+          cache: "no-store"
+        });
+        const text = await response.text();
+        if (!response.ok) {
+          setMessageState((prev) => ({ ...prev, templates: `HTTP ${response.status}` }));
+          return;
+        }
+        let payload: any = null;
+        try {
+          payload = text ? JSON.parse(text) : null;
+        } catch {
+          setMessageState((prev) => ({ ...prev, templates: "Invalid response" }));
+          return;
+        }
+        if (!payload || payload.ok !== true) {
+          setMessageState((prev) => ({ ...prev, templates: payload?.error?.message || "Delete failed" }));
+          return;
+        }
+        setMessageState((prev) => ({ ...prev, templates: "Deleted" }));
+        fetchPromptTemplates();
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "delete failed";
+        setMessageState((prev) => ({ ...prev, templates: message }));
+      } finally {
+        promptTemplateActionInFlightRef.current = false;
+      }
+    },
+    [fetchPromptTemplates]
+  );
   const runBulkUpsert = async (endpoint: string, payload: unknown, signal?: AbortSignal) => {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -780,7 +1475,7 @@ export default function InternalsDictionaryPage() {
     try {
       const formData = new FormData();
       formData.append("file", dictionaryCsvFile);
-      const response = await fetch(`${API_BASE_URL}/api/internals/tagcomplete/import-csv`, {
+      const response = await fetch(`${API_BASE_URL}/api/internals/tag-dictionary/import`, {
         method: "POST",
         body: formData,
         cache: "no-store",
@@ -816,18 +1511,22 @@ export default function InternalsDictionaryPage() {
         }));
         return;
       }
-      const totalRows = typeof payload.data.totalRows === "number" ? payload.data.totalRows : 0;
-      const upserted = typeof payload.data.upserted === "number" ? payload.data.upserted : 0;
-      const errorsSample = Array.isArray(payload.data.errorsSample) ? payload.data.errorsSample : [];
-      const summary = `rows=${totalRows.toLocaleString()} upserted=${upserted.toLocaleString()} errors=${errorsSample.length}`;
+      const inserted = typeof payload.data.inserted === "number" ? payload.data.inserted : 0;
+      const updated = typeof payload.data.updated === "number" ? payload.data.updated : 0;
+      const skipped = typeof payload.data.skipped === "number" ? payload.data.skipped : 0;
+      const errors = Array.isArray(payload.data.errors) ? payload.data.errors : [];
+      const errorCount =
+        typeof payload.data.errorCount === "number" ? payload.data.errorCount : errors.length;
+      const totalRows = inserted + updated + skipped;
+      const summary = `inserted=${inserted.toLocaleString()} updated=${updated.toLocaleString()} skipped=${skipped.toLocaleString()} errors=${errorCount.toLocaleString()}`;
       setImportState((prev) => ({
         ...prev,
         dictionary: {
-          phase: errorsSample.length > 0 ? "error" : "success",
+          phase: errorCount > 0 ? "error" : "success",
           total: totalRows,
-          sent: upserted,
-          failed: errorsSample.length,
-          lastError: errorsSample.length > 0 ? "Some rows failed" : null,
+          sent: inserted + updated,
+          failed: errorCount,
+          lastError: errorCount > 0 ? "Some rows failed" : null,
           lastResultSummary: summary
         }
       }));
@@ -974,11 +1673,13 @@ export default function InternalsDictionaryPage() {
     URL.revokeObjectURL(url);
   };
 
-  const activeDebug = activeTab === "dictionary" ? debugState.dictionary : debugState.translations;
-  const activeMessage = activeTab === "dictionary" ? messageState.dictionary : messageState.translations;
-  const activeImport = activeTab === "dictionary" ? importState.dictionary : importState.translations;
+  const activeDebug = debugState[activeTab] ?? emptyDebug;
+  const activeMessage = messageState[activeTab] ?? null;
+  const activeImport = importState[activeTab] ?? emptyImport;
+  const isTagListTab = activeTab === "dictionary" || activeTab === "translations";
 
   const renderPagination = (tab: TabKey) => {
+    if (tab !== "dictionary" && tab !== "translations") return null;
     const page = tab === "dictionary" ? dictionaryPage : translationPage;
     const total = tab === "dictionary" ? dictionaryTotal : translationTotal;
     const pageCount = tab === "dictionary" ? dictionaryPageCount : translationPageCount;
@@ -1044,10 +1745,44 @@ export default function InternalsDictionaryPage() {
           >
             Translations
           </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab("groups")}
+            className={`rounded-md border px-3 py-2 text-xs transition ${
+              activeTab === "groups"
+                ? "border-emerald-400/60 bg-emerald-500/10 text-emerald-100"
+                : "border-slate-700 text-slate-300 hover:border-emerald-400/60 hover:text-white"
+            }`}
+          >
+            Tag Groups
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab("conflicts")}
+            className={`rounded-md border px-3 py-2 text-xs transition ${
+              activeTab === "conflicts"
+                ? "border-emerald-400/60 bg-emerald-500/10 text-emerald-100"
+                : "border-slate-700 text-slate-300 hover:border-emerald-400/60 hover:text-white"
+            }`}
+          >
+            Conflicts
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab("templates")}
+            className={`rounded-md border px-3 py-2 text-xs transition ${
+              activeTab === "templates"
+                ? "border-emerald-400/60 bg-emerald-500/10 text-emerald-100"
+                : "border-slate-700 text-slate-300 hover:border-emerald-400/60 hover:text-white"
+            }`}
+          >
+            Templates
+          </button>
         </div>
       </section>
 
-      <section className="rounded-2xl border border-slate-800 bg-slate-950/60 p-5 shadow-lg shadow-black/40">
+      {isTagListTab ? (
+        <section className="rounded-2xl border border-slate-800 bg-slate-950/60 p-5 shadow-lg shadow-black/40">
         <div className="flex flex-wrap items-center gap-3">
           <label className="text-xs text-slate-400">Search</label>
           {activeTab === "dictionary" ? (
@@ -1175,7 +1910,72 @@ export default function InternalsDictionaryPage() {
             {activeImport.lastError && <span className="ml-2 text-rose-300">Error: {activeImport.lastError}</span>}
           </div>
         )}
-      </section>
+        </section>
+      ) : (
+        <section className="rounded-2xl border border-slate-800 bg-slate-950/60 p-5 shadow-lg shadow-black/40">
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="text-xs text-slate-400">
+              {activeTab === "groups"
+                ? "Manage grouping rules"
+                : activeTab === "conflicts"
+                  ? "Manage conflict warnings"
+                  : "Manage prompt templates"}
+            </span>
+            <div className="ml-auto flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={
+                  activeTab === "groups"
+                    ? fetchPromptGroups
+                    : activeTab === "conflicts"
+                      ? fetchPromptConflicts
+                      : fetchPromptTemplates
+                }
+                className="rounded-md border border-slate-700 px-3 py-2 text-xs text-slate-200 transition hover:border-emerald-400/60 hover:text-white"
+              >
+                Refresh
+              </button>
+              <button
+                type="button"
+                onClick={
+                  activeTab === "groups"
+                    ? resetPromptGroupForm
+                    : activeTab === "conflicts"
+                      ? resetPromptConflictForm
+                      : resetPromptTemplateForm
+                }
+                className="rounded-md border border-slate-700 px-3 py-2 text-xs text-slate-200 transition hover:border-emerald-400/60 hover:text-white"
+              >
+                Reset
+              </button>
+              <button
+                type="button"
+                onClick={
+                  activeTab === "groups"
+                    ? handleSavePromptGroup
+                    : activeTab === "conflicts"
+                      ? handleSavePromptConflict
+                      : handleSavePromptTemplate
+                }
+                className="rounded-md border border-emerald-500/60 px-3 py-2 text-xs text-emerald-100 transition hover:border-emerald-400 hover:text-white"
+              >
+                {activeTab === "groups"
+                  ? promptGroupEditingId
+                    ? "Update"
+                    : "Create"
+                  : activeTab === "conflicts"
+                    ? promptConflictEditingId
+                      ? "Update"
+                      : "Create"
+                    : promptTemplateEditingId
+                      ? "Update"
+                      : "Create"}
+              </button>
+            </div>
+          </div>
+          {activeMessage && <div className="mt-2 text-xs text-slate-400">{activeMessage}</div>}
+        </section>
+      )}
 
       {activeTab === "dictionary" ? (
         <section className="rounded-2xl border border-slate-800 bg-slate-950/60 p-5 shadow-lg shadow-black/40">
@@ -1185,7 +1985,8 @@ export default function InternalsDictionaryPage() {
                 <tr>
                   <th className="px-3 text-left">Tag</th>
                   <th className="px-3 text-left">Type</th>
-                  <th className="px-3 text-left">Count</th>
+                  <th className="px-3 text-left">Post Count</th>
+                  <th className="px-3 text-left">JA</th>
                   <th className="px-3 text-left">Aliases</th>
                   <th className="px-3 text-left">Updated</th>
                   <th className="px-3 text-right">Actions</th>
@@ -1194,7 +1995,7 @@ export default function InternalsDictionaryPage() {
               <tbody>
                 {dictionaryItems.length === 0 && (
                   <tr>
-                    <td colSpan={6} className="px-3 py-4 text-center text-slate-500">
+                    <td colSpan={7} className="px-3 py-4 text-center text-slate-500">
                       No entries
                     </td>
                   </tr>
@@ -1202,8 +2003,13 @@ export default function InternalsDictionaryPage() {
                 {dictionaryItems.map((entry) => (
                   <tr key={entry.tag} className="rounded-lg bg-slate-900/60">
                     <td className="px-3 py-3 text-slate-100">{entry.tag}</td>
-                    <td className="px-3 py-3 text-slate-300">{entry.type ?? "-"}</td>
-                    <td className="px-3 py-3 text-slate-300">{entry.count ?? "-"}</td>
+                    <td className="px-3 py-3 text-slate-300">
+                      {entry.tag_type ?? entry.type ?? "-"}
+                    </td>
+                    <td className="px-3 py-3 text-slate-300">
+                      {entry.post_count ?? entry.count ?? "-"}
+                    </td>
+                    <td className="px-3 py-3 text-slate-300">{entry.ja ?? "-"}</td>
                     <td className="px-3 py-3 text-slate-400">
                       {(entry.aliases ?? []).join(", ") || "-"}
                     </td>
@@ -1232,7 +2038,7 @@ export default function InternalsDictionaryPage() {
             </table>
           </div>
         </section>
-      ) : (
+      ) : activeTab === "translations" ? (
         <section className="rounded-2xl border border-slate-800 bg-slate-950/60 p-5 shadow-lg shadow-black/40">
           <div className="overflow-x-auto">
             <table className="w-full border-separate border-spacing-y-2 text-sm">
@@ -1273,6 +2079,273 @@ export default function InternalsDictionaryPage() {
                         <button
                           type="button"
                           onClick={() => handleDeleteTranslation(entry.tag)}
+                          className="rounded-md border border-rose-500/60 px-3 py-1 text-xs text-rose-200 transition hover:border-rose-300 hover:text-rose-100"
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : activeTab === "groups" ? (
+        <section className="rounded-2xl border border-slate-800 bg-slate-950/60 p-5 shadow-lg shadow-black/40">
+          <div className="grid gap-3 md:grid-cols-3">
+            <label className="space-y-1 text-xs text-slate-400">
+              Label
+              <input
+                value={promptGroupForm.label}
+                onChange={(event) => setPromptGroupForm((prev) => ({ ...prev, label: event.target.value }))}
+                className="w-full rounded-md border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100 focus:border-emerald-400 focus:outline-none"
+              />
+            </label>
+            <label className="space-y-1 text-xs text-slate-400">
+              Sort Order
+              <input
+                type="number"
+                value={promptGroupForm.sortOrder}
+                onChange={(event) => setPromptGroupForm((prev) => ({ ...prev, sortOrder: event.target.value }))}
+                className="w-full rounded-md border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100 focus:border-emerald-400 focus:outline-none"
+              />
+            </label>
+            <label className="space-y-1 text-xs text-slate-400 md:col-span-1">
+              Filter JSON
+              <textarea
+                rows={3}
+                value={promptGroupForm.filter}
+                onChange={(event) => setPromptGroupForm((prev) => ({ ...prev, filter: event.target.value }))}
+                className="w-full rounded-md border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100 focus:border-emerald-400 focus:outline-none"
+                placeholder='{"tag_type":[4]}'
+              />
+            </label>
+          </div>
+          <div className="mt-4 overflow-x-auto">
+            <table className="w-full border-separate border-spacing-y-2 text-sm">
+              <thead className="text-xs uppercase text-slate-400">
+                <tr>
+                  <th className="px-3 text-left">Label</th>
+                  <th className="px-3 text-left">Sort</th>
+                  <th className="px-3 text-left">Filter</th>
+                  <th className="px-3 text-left">Updated</th>
+                  <th className="px-3 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {promptGroups.length === 0 && (
+                  <tr>
+                    <td colSpan={5} className="px-3 py-4 text-center text-slate-500">
+                      No groups
+                    </td>
+                  </tr>
+                )}
+                {promptGroups.map((entry) => (
+                  <tr key={entry.id} className="rounded-lg bg-slate-900/60">
+                    <td className="px-3 py-3 text-slate-100">{entry.label}</td>
+                    <td className="px-3 py-3 text-slate-300">{entry.sort_order}</td>
+                    <td className="px-3 py-3 text-slate-400">
+                      {entry.filter ? JSON.stringify(entry.filter) : "-"}
+                    </td>
+                    <td className="px-3 py-3 text-slate-400">{formatTimestamp(entry.updated_at ?? null)}</td>
+                    <td className="px-3 py-3 text-right">
+                      <div className="flex justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleEditPromptGroup(entry)}
+                          className="rounded-md border border-slate-700 px-3 py-1 text-xs text-slate-200 transition hover:border-emerald-400/60 hover:text-white"
+                        >
+                          Edit
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleDeletePromptGroup(entry.id)}
+                          className="rounded-md border border-rose-500/60 px-3 py-1 text-xs text-rose-200 transition hover:border-rose-300 hover:text-rose-100"
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : activeTab === "conflicts" ? (
+        <section className="rounded-2xl border border-slate-800 bg-slate-950/60 p-5 shadow-lg shadow-black/40">
+          <div className="grid gap-3 md:grid-cols-4">
+            <label className="space-y-1 text-xs text-slate-400">
+              Tag A
+              <input
+                value={promptConflictForm.a}
+                onChange={(event) => setPromptConflictForm((prev) => ({ ...prev, a: event.target.value }))}
+                className="w-full rounded-md border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100 focus:border-emerald-400 focus:outline-none"
+              />
+            </label>
+            <label className="space-y-1 text-xs text-slate-400">
+              Tag B
+              <input
+                value={promptConflictForm.b}
+                onChange={(event) => setPromptConflictForm((prev) => ({ ...prev, b: event.target.value }))}
+                className="w-full rounded-md border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100 focus:border-emerald-400 focus:outline-none"
+              />
+            </label>
+            <label className="space-y-1 text-xs text-slate-400">
+              Severity
+              <select
+                value={promptConflictForm.severity}
+                onChange={(event) => setPromptConflictForm((prev) => ({ ...prev, severity: event.target.value }))}
+                className="w-full rounded-md border border-slate-800 bg-slate-900 px-2 py-2 text-xs text-slate-100 focus:border-emerald-400 focus:outline-none"
+              >
+                <option value="warn">warn</option>
+              </select>
+            </label>
+            <label className="space-y-1 text-xs text-slate-400 md:col-span-4">
+              Message (optional)
+              <input
+                value={promptConflictForm.message}
+                onChange={(event) => setPromptConflictForm((prev) => ({ ...prev, message: event.target.value }))}
+                className="w-full rounded-md border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100 focus:border-emerald-400 focus:outline-none"
+              />
+            </label>
+          </div>
+          <div className="mt-4 overflow-x-auto">
+            <table className="w-full border-separate border-spacing-y-2 text-sm">
+              <thead className="text-xs uppercase text-slate-400">
+                <tr>
+                  <th className="px-3 text-left">A</th>
+                  <th className="px-3 text-left">B</th>
+                  <th className="px-3 text-left">Message</th>
+                  <th className="px-3 text-left">Created</th>
+                  <th className="px-3 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {promptConflicts.length === 0 && (
+                  <tr>
+                    <td colSpan={5} className="px-3 py-4 text-center text-slate-500">
+                      No conflicts
+                    </td>
+                  </tr>
+                )}
+                {promptConflicts.map((entry) => (
+                  <tr key={entry.id} className="rounded-lg bg-slate-900/60">
+                    <td className="px-3 py-3 text-slate-100">{entry.a}</td>
+                    <td className="px-3 py-3 text-slate-100">{entry.b}</td>
+                    <td className="px-3 py-3 text-slate-400">{entry.message ?? "-"}</td>
+                    <td className="px-3 py-3 text-slate-400">{formatTimestamp(entry.created_at ?? null)}</td>
+                    <td className="px-3 py-3 text-right">
+                      <div className="flex justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleEditPromptConflict(entry)}
+                          className="rounded-md border border-slate-700 px-3 py-1 text-xs text-slate-200 transition hover:border-emerald-400/60 hover:text-white"
+                        >
+                          Edit
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleDeletePromptConflict(entry.id)}
+                          className="rounded-md border border-rose-500/60 px-3 py-1 text-xs text-rose-200 transition hover:border-rose-300 hover:text-rose-100"
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : (
+        <section className="rounded-2xl border border-slate-800 bg-slate-950/60 p-5 shadow-lg shadow-black/40">
+          <div className="grid gap-3 md:grid-cols-4">
+            <label className="space-y-1 text-xs text-slate-400">
+              Name
+              <input
+                value={promptTemplateForm.name}
+                onChange={(event) => setPromptTemplateForm((prev) => ({ ...prev, name: event.target.value }))}
+                className="w-full rounded-md border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100 focus:border-emerald-400 focus:outline-none"
+              />
+            </label>
+            <label className="space-y-1 text-xs text-slate-400">
+              Target
+              <select
+                value={promptTemplateForm.target}
+                onChange={(event) =>
+                  setPromptTemplateForm((prev) => ({
+                    ...prev,
+                    target: event.target.value as PromptTemplateForm["target"]
+                  }))
+                }
+                className="w-full rounded-md border border-slate-800 bg-slate-900 px-2 py-2 text-xs text-slate-100 focus:border-emerald-400 focus:outline-none"
+              >
+                <option value="positive">positive</option>
+                <option value="negative">negative</option>
+                <option value="both">both</option>
+              </select>
+            </label>
+            <label className="space-y-1 text-xs text-slate-400">
+              Sort Order
+              <input
+                type="number"
+                value={promptTemplateForm.sortOrder}
+                onChange={(event) => setPromptTemplateForm((prev) => ({ ...prev, sortOrder: event.target.value }))}
+                className="w-full rounded-md border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100 focus:border-emerald-400 focus:outline-none"
+              />
+            </label>
+            <label className="space-y-1 text-xs text-slate-400 md:col-span-4">
+              Tokens (comma / newline)
+              <textarea
+                rows={3}
+                value={promptTemplateForm.tokens}
+                onChange={(event) => setPromptTemplateForm((prev) => ({ ...prev, tokens: event.target.value }))}
+                className="w-full rounded-md border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100 focus:border-emerald-400 focus:outline-none"
+              />
+            </label>
+          </div>
+          <div className="mt-4 overflow-x-auto">
+            <table className="w-full border-separate border-spacing-y-2 text-sm">
+              <thead className="text-xs uppercase text-slate-400">
+                <tr>
+                  <th className="px-3 text-left">Name</th>
+                  <th className="px-3 text-left">Target</th>
+                  <th className="px-3 text-left">Tokens</th>
+                  <th className="px-3 text-left">Sort</th>
+                  <th className="px-3 text-left">Updated</th>
+                  <th className="px-3 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {promptTemplates.length === 0 && (
+                  <tr>
+                    <td colSpan={6} className="px-3 py-4 text-center text-slate-500">
+                      No templates
+                    </td>
+                  </tr>
+                )}
+                {promptTemplates.map((entry) => (
+                  <tr key={entry.id} className="rounded-lg bg-slate-900/60">
+                    <td className="px-3 py-3 text-slate-100">{entry.name}</td>
+                    <td className="px-3 py-3 text-slate-300">{entry.target}</td>
+                    <td className="px-3 py-3 text-slate-400">{entry.tokens.join(", ") || "-"}</td>
+                    <td className="px-3 py-3 text-slate-300">{entry.sort_order}</td>
+                    <td className="px-3 py-3 text-slate-400">{formatTimestamp(entry.updated_at ?? null)}</td>
+                    <td className="px-3 py-3 text-right">
+                      <div className="flex justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleEditPromptTemplate(entry)}
+                          className="rounded-md border border-slate-700 px-3 py-1 text-xs text-slate-200 transition hover:border-emerald-400/60 hover:text-white"
+                        >
+                          Edit
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleDeletePromptTemplate(entry.id)}
                           className="rounded-md border border-rose-500/60 px-3 py-1 text-xs text-rose-200 transition hover:border-rose-300 hover:text-rose-100"
                         >
                           Delete

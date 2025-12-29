@@ -1,4 +1,4 @@
-import { type KeyboardEvent, type FocusEvent, type ChangeEvent, type HTMLAttributes } from "react";
+import { type KeyboardEvent, type FocusEvent, type ChangeEvent, type HTMLAttributes, type ReactNode } from "react";
 
 type TranslationEntry = {
   status: "pending" | "done" | "error";
@@ -18,6 +18,7 @@ type PromptChipProps = {
   translation?: TranslationEntry;
   onRetranslate?: () => void;
   rootProps?: HTMLAttributes<HTMLDivElement>;
+  menu?: ReactNode;
 };
 
 export default function PromptChip({
@@ -31,7 +32,8 @@ export default function PromptChip({
   onRemove,
   translation,
   onRetranslate,
-  rootProps
+  rootProps,
+  menu
 }: PromptChipProps) {
   if (isEditing) {
     const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
@@ -105,6 +107,7 @@ export default function PromptChip({
         {translationLabel && <span className={translationClass}>{translationLabel}</span>}
       </button>
       <div className="flex items-center gap-1">
+        {menu}
         {onRetranslate && (
           <button
             type="button"

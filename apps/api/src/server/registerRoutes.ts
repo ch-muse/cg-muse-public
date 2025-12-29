@@ -3,6 +3,7 @@ import express from "express";
 import multer, { type FileFilterCallback } from "multer";
 import { randomInt, randomUUID } from "crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { Pool, PoolClient } from "pg";
@@ -145,6 +146,10 @@ const encodeMediaKey = (value: string) =>
     .map((segment) => encodeURIComponent(segment))
     .join("/");
 
+const TAG_DICTIONARY_CSV_MAX_BYTES = 50 * 1024 * 1024;
+const TAG_DICTIONARY_TMP_DIR = path.join(os.tmpdir(), "cg-muse");
+fs.mkdirSync(TAG_DICTIONARY_TMP_DIR, { recursive: true });
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 },
@@ -167,6 +172,19 @@ const csvUpload = multer({
   limits: { fileSize: 200 * 1024 * 1024 }
 });
 
+const tagDictionaryUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => {
+      cb(null, TAG_DICTIONARY_TMP_DIR);
+    },
+    filename: (_req, file, cb) => {
+      const ext = path.extname(file.originalname || "").trim() || ".csv";
+      cb(null, `tag_dictionary_${Date.now()}_${randomUUID()}${ext}`);
+    }
+  }),
+  limits: { fileSize: TAG_DICTIONARY_CSV_MAX_BYTES }
+});
+
 const runMulterSingle = (req: express.Request, res: express.Response) =>
   new Promise<void>((resolve, reject) => {
     upload.single("file")(req, res, (err: unknown) => {
@@ -186,6 +204,14 @@ const runWhisperUpload = (req: express.Request, res: express.Response) =>
 const runCsvUpload = (req: express.Request, res: express.Response) =>
   new Promise<void>((resolve, reject) => {
     csvUpload.single("file")(req, res, (err: unknown) => {
+      if (err) return reject(err);
+      resolve();
+    });
+  });
+
+const runTagDictionaryUpload = (req: express.Request, res: express.Response) =>
+  new Promise<void>((resolve, reject) => {
+    tagDictionaryUpload.single("file")(req, res, (err: unknown) => {
       if (err) return reject(err);
       resolve();
     });
@@ -3910,6 +3936,12 @@ const tagQuerySchema = z.object({
   offset: z.coerce.number().int().min(0).optional()
 });
 
+const tagSearchQuerySchema = z.object({
+  query: z.string().trim().optional(),
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+  offset: z.coerce.number().int().min(0).optional()
+});
+
 const tagDictionaryUpsertSchema = z.object({
   tag: z.string().trim().min(1),
   type: z.string().trim().optional(),
@@ -3935,6 +3967,54 @@ const tagTranslationBulkSchema = z.object({
 const tagTranslationLookupSchema = z.object({
   tags: z.array(z.string()).min(1).max(200)
 });
+
+const promptTagGroupCreateSchema = z.object({
+  label: z.string().trim().min(1),
+  sortOrder: z.coerce.number().int().optional(),
+  filter: z.record(z.any()).optional()
+});
+
+const promptTagGroupUpdateSchema = z
+  .object({
+    label: z.string().trim().min(1).optional(),
+    sortOrder: z.coerce.number().int().optional(),
+    filter: z.record(z.any()).optional()
+  })
+  .refine((data) => data.label !== undefined || data.sortOrder !== undefined || data.filter !== undefined, {
+    message: "Nothing to update"
+  });
+
+const promptTagGroupOverrideSchema = z.object({
+  groupId: z.union([z.coerce.number().int().min(1), z.null()])
+});
+
+const promptConflictCreateSchema = z.object({
+  a: z.string().trim().min(1),
+  b: z.string().trim().min(1),
+  severity: z.enum(["warn"]).optional(),
+  message: z.string().trim().optional()
+});
+
+const promptTemplateCreateSchema = z.object({
+  name: z.string().trim().min(1),
+  target: z.enum(["positive", "negative", "both"]),
+  tokens: z.array(z.string().trim().min(1)).min(1),
+  sortOrder: z.coerce.number().int().optional()
+});
+
+const promptTemplateUpdateSchema = z
+  .object({
+    name: z.string().trim().min(1).optional(),
+    target: z.enum(["positive", "negative", "both"]).optional(),
+    tokens: z.array(z.string().trim().min(1)).min(1).optional(),
+    sortOrder: z.coerce.number().int().optional()
+  })
+  .refine(
+    (data) => data.name !== undefined || data.target !== undefined || data.tokens !== undefined || data.sortOrder !== undefined,
+    {
+      message: "Nothing to update"
+    }
+  );
 
 app.post(
   "/api/muse/generate",
@@ -4179,8 +4259,8 @@ app.post(
       const values: any[] = [];
       const placeholders = batch.map((item, idx) => {
         const base = idx * 4;
-        values.push(item.tag, item.type, item.count, item.aliases);
-        return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4})`;
+        values.push(item.tag, item.type, item.count, JSON.stringify(item.aliases));
+        return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}::jsonb)`;
       });
       try {
         await pool.query(
@@ -4263,6 +4343,321 @@ app.post(
   })
 );
 
+app.post(
+  "/api/internals/tag-dictionary/import",
+  asyncHandler(async (req, res) => {
+    try {
+      await runTagDictionaryUpload(req, res);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Invalid upload";
+      return respondError(res, 400, "Invalid upload", { message });
+    }
+
+    const file = (req as any).file as Express.Multer.File | undefined;
+    if (!file?.path) {
+      return respondError(res, 400, "File is required");
+    }
+
+    const errors: Array<{ row: number; message: string; raw?: unknown }> = [];
+    let errorCount = 0;
+    let inserted = 0;
+    let updated = 0;
+    let skipped = 0;
+    let rowNumber = 0;
+
+    const pushError = (row: number, message: string, raw?: unknown) => {
+      errorCount += 1;
+      if (errors.length >= TAG_CSV_ERRORS_SAMPLE_LIMIT) return;
+      errors.push(raw ? { row, message, raw } : { row, message });
+    };
+
+    const normalizeHeaderKey = (value: string) => value.trim().toLowerCase().replace(/[\s-]+/g, "_");
+    const headerAliases: Record<string, string> = {
+      tag: "tag",
+      name: "tag",
+      tag_name: "tag",
+      tag_type: "tag_type",
+      type: "tag_type",
+      category: "tag_type",
+      post_count: "post_count",
+      count: "post_count",
+      posts: "post_count",
+      aliases: "aliases",
+      alias: "aliases",
+      ja: "ja",
+      jp: "ja",
+      japanese: "ja"
+    };
+
+    const parseAliasesCell = (value: unknown) => {
+      if (typeof value === "string") {
+        const trimmed = value.trim();
+        if (!trimmed) return [];
+        if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+          try {
+            const parsed = JSON.parse(trimmed);
+            return normalizeStringList(parsed);
+          } catch {
+            return normalizeStringList(trimmed.replace(/\|/g, ","));
+          }
+        }
+        return normalizeStringList(trimmed.replace(/\|/g, ","));
+      }
+      return normalizeStringList(value);
+    };
+
+    const dedupeAliases = (aliases: string[]) => {
+      const seen = new Set<string>();
+      const result: string[] = [];
+      for (const alias of aliases) {
+        const key = alias.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        result.push(alias);
+      }
+      return result;
+    };
+
+    const parseNumberCell = (value: unknown, row: number, field: string) => {
+      const raw = String(value ?? "").trim();
+      if (!raw) return null;
+      const parsed = Number(raw);
+      if (!Number.isFinite(parsed)) {
+        pushError(row, `${field} is not a number`, { value: raw });
+        return null;
+      }
+      return Math.trunc(parsed);
+    };
+
+    type TagDictionaryItem = {
+      row: number;
+      tag: string;
+      tagType: number | null;
+      postCount: number | null;
+      aliases: string[];
+      ja: string | null;
+    };
+
+    const batch: TagDictionaryItem[] = [];
+
+    const upsertOne = async (item: TagDictionaryItem) => {
+      const result = await pool.query(
+        `INSERT INTO tag_dictionary_entries (tag, tag_type, post_count, aliases, ja, created_at, updated_at)
+         VALUES ($1, $2, $3, $4::jsonb, $5, NOW(), NOW())
+         ON CONFLICT (tag) DO UPDATE
+           SET tag_type = EXCLUDED.tag_type,
+               post_count = EXCLUDED.post_count,
+               aliases = EXCLUDED.aliases,
+               ja = EXCLUDED.ja,
+               updated_at = NOW()
+         RETURNING (xmax = 0) AS inserted`,
+        [item.tag, item.tagType, item.postCount, JSON.stringify(item.aliases), item.ja]
+      );
+      if (result.rows[0]?.inserted) {
+        inserted += 1;
+      } else {
+        updated += 1;
+      }
+    };
+
+    const flushBatch = async () => {
+      if (batch.length === 0) return;
+      const values: any[] = [];
+      const placeholders = batch.map((item, idx) => {
+        const base = idx * 5;
+        values.push(item.tag, item.tagType, item.postCount, JSON.stringify(item.aliases), item.ja);
+        return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}::jsonb, $${base + 5})`;
+      });
+      try {
+        const result = await pool.query(
+          `INSERT INTO tag_dictionary_entries (tag, tag_type, post_count, aliases, ja, created_at, updated_at)
+           VALUES ${placeholders.join(", ")}
+           ON CONFLICT (tag) DO UPDATE
+             SET tag_type = EXCLUDED.tag_type,
+                 post_count = EXCLUDED.post_count,
+                 aliases = EXCLUDED.aliases,
+                 ja = EXCLUDED.ja,
+                 updated_at = NOW()
+           RETURNING (xmax = 0) AS inserted`,
+          values
+        );
+        for (const row of result.rows) {
+          if (row.inserted) {
+            inserted += 1;
+          } else {
+            updated += 1;
+          }
+        }
+      } catch (err) {
+        for (const item of batch) {
+          try {
+            await upsertOne(item);
+          } catch (innerErr) {
+            skipped += 1;
+            const message = innerErr instanceof Error ? innerErr.message : "Database error";
+            pushError(item.row, message, { tag: item.tag });
+          }
+        }
+      } finally {
+        batch.length = 0;
+      }
+    };
+
+    const parser = parse({
+      bom: true,
+      relax_quotes: true,
+      relax_column_count: true,
+      skip_empty_lines: true
+    });
+
+    let headerMap: Record<string, number> | null = null;
+    let headerChecked = false;
+
+    try {
+      const stream = fs.createReadStream(file.path);
+      stream.pipe(parser);
+
+      for await (const record of parser) {
+        rowNumber += 1;
+        if (!Array.isArray(record)) {
+          skipped += 1;
+          pushError(rowNumber, "Invalid record");
+          continue;
+        }
+
+        if (!headerChecked) {
+          const normalized = record.map((value) => normalizeHeaderKey(String(value ?? "")));
+          const headerKeys = normalized.filter((key) => key in headerAliases);
+          const hasTagKey = headerKeys.some((key) => headerAliases[key] === "tag");
+          if (hasTagKey && headerKeys.length >= 2) {
+            headerMap = {};
+            normalized.forEach((key, idx) => {
+              const mapped = headerAliases[key];
+              if (mapped && headerMap && headerMap[mapped] === undefined) {
+                headerMap[mapped] = idx;
+              }
+            });
+            headerChecked = true;
+            continue;
+          }
+          headerChecked = true;
+          headerMap = null;
+        }
+
+        const getCell = (key: string, fallbackIndex: number) => {
+          if (headerMap) {
+            const idx = headerMap[key];
+            return idx === undefined ? undefined : record[idx];
+          }
+          return record[fallbackIndex];
+        };
+
+        const tagRaw = String(getCell("tag", 0) ?? "").trim();
+        if (!tagRaw) {
+          skipped += 1;
+          pushError(rowNumber, "tag is required");
+          continue;
+        }
+
+        const tagType = parseNumberCell(getCell("tag_type", 1), rowNumber, "tag_type");
+        const postCount = parseNumberCell(getCell("post_count", 2), rowNumber, "post_count");
+        const aliases = dedupeAliases(parseAliasesCell(getCell("aliases", 3)));
+        const jaRaw = String(getCell("ja", 4) ?? "").trim();
+        const ja = jaRaw ? jaRaw : null;
+
+        batch.push({ row: rowNumber, tag: tagRaw, tagType, postCount, aliases, ja });
+        if (batch.length >= TAG_CSV_BATCH_SIZE) {
+          await flushBatch();
+        }
+      }
+
+      await flushBatch();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "CSV parse failed";
+      return respondError(res, 400, "CSV parse failed", { message });
+    } finally {
+      try {
+        await fs.promises.unlink(file.path);
+      } catch {
+        // ignore cleanup errors
+      }
+    }
+
+    res.json({ ok: true, data: { inserted, updated, skipped, errorCount, errors } });
+  })
+);
+
+app.get(
+  "/api/tags/search",
+  asyncHandler(async (req, res) => {
+    const parsed = tagSearchQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      return respondError(res, 400, "Invalid request", parsed.error.flatten());
+    }
+    const limit = parsed.data.limit ?? 50;
+    const offset = parsed.data.offset ?? 0;
+    const queryRaw = parsed.data.query?.trim() ?? "";
+    if (queryRaw.length <= 1) {
+      return res.json({ ok: true, data: { items: [] } });
+    }
+    const query = queryRaw.toLowerCase();
+    const queryAlt = query.replace(/[\s-]+/g, "_");
+    const uniqueTerms = Array.from(new Set([query, queryAlt].filter((term) => term.length > 0)));
+    if (uniqueTerms.length === 0) {
+      return res.json({ ok: true, data: { items: [] } });
+    }
+
+    const exactTerms = uniqueTerms;
+    const prefixPatterns = uniqueTerms.map((term) => `${term}%`);
+    const containsPatterns = uniqueTerms.map((term) => `%${term}%`);
+
+    const itemsResult = await pool.query(
+      `SELECT tag, tag_type, post_count, aliases, ja,
+              LEAST(
+                CASE
+                  WHEN lower(tag) = ANY($1) THEN 0
+                  WHEN lower(tag) LIKE ANY($2) THEN 1
+                  WHEN lower(tag) LIKE ANY($3) THEN 2
+                  ELSE 9
+                END,
+                COALESCE(
+                  (SELECT MIN(
+                    CASE
+                      WHEN lower(alias) = ANY($1) THEN 0
+                      WHEN lower(alias) LIKE ANY($2) THEN 1
+                      WHEN lower(alias) LIKE ANY($3) THEN 2
+                      ELSE 9
+                    END
+                  )
+                   FROM jsonb_array_elements_text(COALESCE(aliases, '[]'::jsonb)) alias),
+                  9
+                )
+              ) AS rank
+       FROM tag_dictionary_entries
+       WHERE lower(tag) LIKE ANY($3)
+          OR EXISTS (
+            SELECT 1
+            FROM jsonb_array_elements_text(COALESCE(aliases, '[]'::jsonb)) alias
+            WHERE lower(alias) LIKE ANY($3)
+          )
+       ORDER BY rank ASC, post_count DESC NULLS LAST, length(tag) ASC, tag ASC
+       LIMIT $4
+       OFFSET $5`,
+      [exactTerms, prefixPatterns, containsPatterns, limit, offset]
+    );
+
+    const items = itemsResult.rows.map((row) => ({
+      tag: row.tag,
+      tagType: row.tag_type,
+      postCount: row.post_count,
+      aliases: row.aliases ?? [],
+      ja: row.ja ?? null
+    }));
+
+    res.json({ ok: true, data: { items } });
+  })
+);
+
 app.get(
   "/api/tags/dictionary",
   asyncHandler(async (req, res) => {
@@ -4282,7 +4677,15 @@ app.get(
 
     if (uniqueTerms.length === 0) {
       itemsResult = await pool.query(
-        `SELECT tag, type, count, aliases, created_at, updated_at
+        `SELECT tag,
+                type,
+                count,
+                aliases,
+                tag_type,
+                COALESCE(post_count, count) AS post_count,
+                ja,
+                created_at,
+                updated_at
          FROM tag_dictionary_entries
          ORDER BY tag ASC
          LIMIT $1
@@ -4295,7 +4698,15 @@ app.get(
       const prefixPatterns = uniqueTerms.map((term) => `${term}%`);
       const containsPatterns = uniqueTerms.map((term) => `%${term}%`);
       itemsResult = await pool.query(
-        `SELECT tag, type, count, aliases, created_at, updated_at,
+        `SELECT tag,
+                type,
+                count,
+                aliases,
+                tag_type,
+                COALESCE(post_count, count) AS post_count,
+                ja,
+                created_at,
+                updated_at,
                 LEAST(
                   CASE
                     WHEN lower(tag) = ANY($1) THEN 0
@@ -4312,7 +4723,7 @@ app.get(
                         ELSE 9
                       END
                     )
-                     FROM unnest(COALESCE(aliases, '{}'::text[])) alias),
+                     FROM jsonb_array_elements_text(COALESCE(aliases, '[]'::jsonb)) alias),
                     9
                   )
                 ) AS rank
@@ -4320,10 +4731,10 @@ app.get(
          WHERE lower(tag) LIKE ANY($3)
             OR EXISTS (
               SELECT 1
-              FROM unnest(COALESCE(aliases, '{}'::text[])) alias
+              FROM jsonb_array_elements_text(COALESCE(aliases, '[]'::jsonb)) alias
               WHERE lower(alias) LIKE ANY($3)
             )
-         ORDER BY rank ASC, count DESC NULLS LAST, length(tag) ASC, tag ASC
+         ORDER BY rank ASC, COALESCE(post_count, count) DESC NULLS LAST, length(tag) ASC, tag ASC
          LIMIT $4
          OFFSET $5`,
         [exactTerms, prefixPatterns, containsPatterns, limit, offset]
@@ -4334,7 +4745,7 @@ app.get(
          WHERE lower(tag) LIKE ANY($1)
             OR EXISTS (
               SELECT 1
-              FROM unnest(COALESCE(aliases, '{}'::text[])) alias
+              FROM jsonb_array_elements_text(COALESCE(aliases, '[]'::jsonb)) alias
               WHERE lower(alias) LIKE ANY($1)
             )`,
         [containsPatterns]
@@ -4356,17 +4767,18 @@ app.put(
     const type = parsed.data.type?.trim() || null;
     const count = typeof parsed.data.count === "number" ? parsed.data.count : null;
     const aliases = extractStringArray(parsed.data.aliases ?? []);
+    const aliasesJson = JSON.stringify(aliases);
 
     const result = await pool.query(
       `INSERT INTO tag_dictionary_entries (tag, type, count, aliases, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, NOW(), NOW())
+       VALUES ($1, $2, $3, $4::jsonb, NOW(), NOW())
        ON CONFLICT (tag) DO UPDATE
          SET type = EXCLUDED.type,
              count = EXCLUDED.count,
              aliases = EXCLUDED.aliases,
              updated_at = NOW()
        RETURNING tag, type, count, aliases, created_at, updated_at`,
-      [tag, type, count, aliases]
+      [tag, type, count, aliasesJson]
     );
     res.json({ ok: true, data: { entry: result.rows[0] } });
   })
@@ -4419,8 +4831,8 @@ app.post(
       const values: any[] = [];
       const placeholders = items.map((item, idx) => {
         const base = idx * 4;
-        values.push(item.tag, item.type, item.count, item.aliases);
-        return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4})`;
+        values.push(item.tag, item.type, item.count, JSON.stringify(item.aliases));
+        return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}::jsonb)`;
       });
       await client.query(
         `INSERT INTO tag_dictionary_entries (tag, type, count, aliases)
@@ -4586,6 +4998,275 @@ app.delete(
       return respondError(res, 404, "Tag not found");
     }
     res.json({ ok: true, data: { tag } });
+  })
+);
+
+app.get(
+  "/api/prompt/tag-groups",
+  asyncHandler(async (_req, res) => {
+    const result = await pool.query(
+      `SELECT id, label, sort_order, filter, created_at, updated_at
+       FROM prompt_tag_groups
+       ORDER BY sort_order ASC, id ASC`
+    );
+    res.json({ ok: true, data: { groups: result.rows } });
+  })
+);
+
+app.post(
+  "/api/prompt/tag-groups",
+  asyncHandler(async (req, res) => {
+    const parsed = promptTagGroupCreateSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return respondError(res, 400, "Invalid request", parsed.error.flatten());
+    }
+    const label = parsed.data.label.trim();
+    const sortOrder = parsed.data.sortOrder ?? 0;
+    const filter = parsed.data.filter ? JSON.stringify(parsed.data.filter) : null;
+
+    const result = await pool.query(
+      `INSERT INTO prompt_tag_groups (label, sort_order, filter, created_at, updated_at)
+       VALUES ($1, $2, COALESCE($3::jsonb, '{"tag_type":[4]}'::jsonb), NOW(), NOW())
+       RETURNING id, label, sort_order, filter, created_at, updated_at`,
+      [label, sortOrder, filter]
+    );
+    res.status(201).json({ ok: true, data: { group: result.rows[0] } });
+  })
+);
+
+app.patch(
+  "/api/prompt/tag-groups/:id",
+  asyncHandler(async (req, res) => {
+    const groupId = z.coerce.number().int().min(1).safeParse(req.params.id);
+    if (!groupId.success) {
+      return respondError(res, 400, "Invalid group id");
+    }
+    const parsed = promptTagGroupUpdateSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return respondError(res, 400, "Invalid request", parsed.error.flatten());
+    }
+
+    const updates: string[] = [];
+    const values: any[] = [];
+    let idx = 1;
+    if (parsed.data.label !== undefined) {
+      updates.push(`label = $${idx++}`);
+      values.push(parsed.data.label.trim());
+    }
+    if (parsed.data.sortOrder !== undefined) {
+      updates.push(`sort_order = $${idx++}`);
+      values.push(parsed.data.sortOrder);
+    }
+    if (parsed.data.filter !== undefined) {
+      updates.push(`filter = $${idx++}::jsonb`);
+      values.push(JSON.stringify(parsed.data.filter));
+    }
+    updates.push("updated_at = NOW()");
+    values.push(groupId.data);
+
+    const result = await pool.query(
+      `UPDATE prompt_tag_groups SET ${updates.join(", ")} WHERE id = $${idx}
+       RETURNING id, label, sort_order, filter, created_at, updated_at`,
+      values
+    );
+    if (result.rowCount === 0) {
+      return respondError(res, 404, "Group not found");
+    }
+    res.json({ ok: true, data: { group: result.rows[0] } });
+  })
+);
+
+app.delete(
+  "/api/prompt/tag-groups/:id",
+  asyncHandler(async (req, res) => {
+    const groupId = z.coerce.number().int().min(1).safeParse(req.params.id);
+    if (!groupId.success) {
+      return respondError(res, 400, "Invalid group id");
+    }
+    const result = await pool.query("DELETE FROM prompt_tag_groups WHERE id = $1 RETURNING id", [groupId.data]);
+    if (result.rowCount === 0) {
+      return respondError(res, 404, "Group not found");
+    }
+    res.json({ ok: true, data: { id: result.rows[0].id } });
+  })
+);
+
+app.put(
+  "/api/prompt/tag-group-overrides/:tag",
+  asyncHandler(async (req, res) => {
+    const tagRaw = safeDecodeURIComponent(req.params.tag || "").trim();
+    if (!tagRaw) {
+      return respondError(res, 400, "Invalid tag");
+    }
+    const parsed = promptTagGroupOverrideSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return respondError(res, 400, "Invalid request", parsed.error.flatten());
+    }
+
+    if (parsed.data.groupId === null) {
+      await pool.query("DELETE FROM prompt_tag_group_overrides WHERE lower(tag) = lower($1)", [tagRaw]);
+      return res.json({ ok: true, data: { tag: tagRaw, groupId: null } });
+    }
+
+    const tagResult = await pool.query("SELECT tag FROM tag_dictionary_entries WHERE lower(tag) = lower($1)", [tagRaw]);
+    if (tagResult.rowCount === 0) {
+      return respondError(res, 404, "Tag not found");
+    }
+    const groupResult = await pool.query("SELECT id FROM prompt_tag_groups WHERE id = $1", [parsed.data.groupId]);
+    if (groupResult.rowCount === 0) {
+      return respondError(res, 404, "Group not found");
+    }
+
+    const result = await pool.query(
+      `INSERT INTO prompt_tag_group_overrides (tag, group_id, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (tag) DO UPDATE
+         SET group_id = EXCLUDED.group_id,
+             updated_at = NOW()
+       RETURNING tag, group_id, updated_at`,
+      [tagResult.rows[0].tag, parsed.data.groupId]
+    );
+    res.json({ ok: true, data: { override: result.rows[0] } });
+  })
+);
+
+app.get(
+  "/api/prompt/conflicts",
+  asyncHandler(async (_req, res) => {
+    const result = await pool.query(
+      `SELECT id, a, b, severity, message, created_at
+       FROM prompt_conflict_rules
+       ORDER BY id ASC`
+    );
+    res.json({ ok: true, data: { conflicts: result.rows } });
+  })
+);
+
+app.post(
+  "/api/prompt/conflicts",
+  asyncHandler(async (req, res) => {
+    const parsed = promptConflictCreateSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return respondError(res, 400, "Invalid request", parsed.error.flatten());
+    }
+    const severity = parsed.data.severity ?? "warn";
+    const message = parsed.data.message?.trim() || null;
+
+    const result = await pool.query(
+      `INSERT INTO prompt_conflict_rules (a, b, severity, message, created_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       RETURNING id, a, b, severity, message, created_at`,
+      [parsed.data.a.trim(), parsed.data.b.trim(), severity, message]
+    );
+    res.status(201).json({ ok: true, data: { conflict: result.rows[0] } });
+  })
+);
+
+app.delete(
+  "/api/prompt/conflicts/:id",
+  asyncHandler(async (req, res) => {
+    const conflictId = z.coerce.number().int().min(1).safeParse(req.params.id);
+    if (!conflictId.success) {
+      return respondError(res, 400, "Invalid conflict id");
+    }
+    const result = await pool.query("DELETE FROM prompt_conflict_rules WHERE id = $1 RETURNING id", [conflictId.data]);
+    if (result.rowCount === 0) {
+      return respondError(res, 404, "Conflict not found");
+    }
+    res.json({ ok: true, data: { id: result.rows[0].id } });
+  })
+);
+
+app.get(
+  "/api/prompt/templates",
+  asyncHandler(async (_req, res) => {
+    const result = await pool.query(
+      `SELECT id, name, target, tokens, sort_order, created_at, updated_at
+       FROM prompt_templates
+       ORDER BY sort_order ASC, id ASC`
+    );
+    res.json({ ok: true, data: { templates: result.rows } });
+  })
+);
+
+app.post(
+  "/api/prompt/templates",
+  asyncHandler(async (req, res) => {
+    const parsed = promptTemplateCreateSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return respondError(res, 400, "Invalid request", parsed.error.flatten());
+    }
+    const sortOrder = parsed.data.sortOrder ?? 0;
+    const tokensJson = JSON.stringify(parsed.data.tokens);
+
+    const result = await pool.query(
+      `INSERT INTO prompt_templates (name, target, tokens, sort_order, created_at, updated_at)
+       VALUES ($1, $2, $3::jsonb, $4, NOW(), NOW())
+       RETURNING id, name, target, tokens, sort_order, created_at, updated_at`,
+      [parsed.data.name.trim(), parsed.data.target, tokensJson, sortOrder]
+    );
+    res.status(201).json({ ok: true, data: { template: result.rows[0] } });
+  })
+);
+
+app.patch(
+  "/api/prompt/templates/:id",
+  asyncHandler(async (req, res) => {
+    const templateId = z.coerce.number().int().min(1).safeParse(req.params.id);
+    if (!templateId.success) {
+      return respondError(res, 400, "Invalid template id");
+    }
+    const parsed = promptTemplateUpdateSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return respondError(res, 400, "Invalid request", parsed.error.flatten());
+    }
+
+    const updates: string[] = [];
+    const values: any[] = [];
+    let idx = 1;
+    if (parsed.data.name !== undefined) {
+      updates.push(`name = $${idx++}`);
+      values.push(parsed.data.name.trim());
+    }
+    if (parsed.data.target !== undefined) {
+      updates.push(`target = $${idx++}`);
+      values.push(parsed.data.target);
+    }
+    if (parsed.data.tokens !== undefined) {
+      updates.push(`tokens = $${idx++}::jsonb`);
+      values.push(JSON.stringify(parsed.data.tokens));
+    }
+    if (parsed.data.sortOrder !== undefined) {
+      updates.push(`sort_order = $${idx++}`);
+      values.push(parsed.data.sortOrder);
+    }
+    updates.push("updated_at = NOW()");
+    values.push(templateId.data);
+
+    const result = await pool.query(
+      `UPDATE prompt_templates SET ${updates.join(", ")} WHERE id = $${idx}
+       RETURNING id, name, target, tokens, sort_order, created_at, updated_at`,
+      values
+    );
+    if (result.rowCount === 0) {
+      return respondError(res, 404, "Template not found");
+    }
+    res.json({ ok: true, data: { template: result.rows[0] } });
+  })
+);
+
+app.delete(
+  "/api/prompt/templates/:id",
+  asyncHandler(async (req, res) => {
+    const templateId = z.coerce.number().int().min(1).safeParse(req.params.id);
+    if (!templateId.success) {
+      return respondError(res, 400, "Invalid template id");
+    }
+    const result = await pool.query("DELETE FROM prompt_templates WHERE id = $1 RETURNING id", [templateId.data]);
+    if (result.rowCount === 0) {
+      return respondError(res, 404, "Template not found");
+    }
+    res.json({ ok: true, data: { id: result.rows[0].id } });
   })
 );
 

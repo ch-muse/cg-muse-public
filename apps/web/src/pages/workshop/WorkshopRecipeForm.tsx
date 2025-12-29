@@ -885,6 +885,7 @@ export default function WorkshopRecipeForm() {
               <div className="md:col-span-1">
                 <PromptComposer
                   label="Prompt Positive"
+                  target="positive"
                   value={form.positive}
                   onChange={(value) => setForm((prev) => ({ ...prev, positive: value }))}
                   onClear={() => setForm((prev) => ({ ...prev, positive: "" }))}
@@ -894,6 +895,7 @@ export default function WorkshopRecipeForm() {
               <div className="md:col-span-1">
                 <PromptComposer
                   label="Prompt Negative"
+                  target="negative"
                   value={form.negative}
                   onChange={(value) => setForm((prev) => ({ ...prev, negative: value }))}
                   onClear={() => setForm((prev) => ({ ...prev, negative: "" }))}

@@ -6,7 +6,9 @@ import {
   useState,
   type KeyboardEvent,
   type ChangeEvent,
-  type ClipboardEvent
+  type ClipboardEvent,
+  type MouseEvent,
+  type ReactNode
 } from "react";
 import {
   DndContext,
@@ -43,6 +45,7 @@ type PromptComposerProps = {
   suggestionLimit?: number;
   showClear?: boolean;
   onClear?: () => void;
+  target?: "positive" | "negative";
 };
 
 type TagSuggestion = {
@@ -50,6 +53,34 @@ type TagSuggestion = {
   type?: string;
   count?: number;
   aliases?: string[];
+};
+
+type TagGroup = {
+  id: number;
+  label: string;
+  sortOrder: number;
+  filter: Record<string, unknown> | null;
+};
+
+type PromptTemplate = {
+  id: number;
+  name: string;
+  target: "positive" | "negative" | "both";
+  tokens: string[];
+  sortOrder: number;
+};
+
+type PromptConflictRule = {
+  id: number;
+  a: string;
+  b: string;
+  severity: string;
+  message: string | null;
+};
+
+type TagMetaCacheEntry = {
+  tagType: number | null;
+  updatedAt: number;
 };
 
 const splitTokens = (value: string) =>
@@ -109,6 +140,39 @@ const chunkArray = (items: string[], size: number) => {
 const dictionaryTagCache = new Map<string, { exists: boolean; updatedAt: number }>();
 const dictionaryTagSet = new Set<string>();
 const dictionaryLookupInFlight = new Map<string, Promise<boolean>>();
+const TAG_GROUP_CACHE_TTL_MS = 5 * 60_000;
+const TEMPLATE_CACHE_TTL_MS = 5 * 60_000;
+const CONFLICT_CACHE_TTL_MS = 5 * 60_000;
+const TAG_META_CACHE_TTL_MS = 10 * 60_000;
+const tagMetaCache = new Map<string, TagMetaCacheEntry>();
+const tagMetaInFlight = new Map<string, Promise<void>>();
+const promptTagGroupCache: {
+  data: TagGroup[] | null;
+  updatedAt: number;
+  inFlight: Promise<TagGroup[]> | null;
+} = {
+  data: null,
+  updatedAt: 0,
+  inFlight: null
+};
+const promptTemplateCache: {
+  data: PromptTemplate[] | null;
+  updatedAt: number;
+  inFlight: Promise<PromptTemplate[]> | null;
+} = {
+  data: null,
+  updatedAt: 0,
+  inFlight: null
+};
+const promptConflictCache: {
+  data: PromptConflictRule[] | null;
+  updatedAt: number;
+  inFlight: Promise<PromptConflictRule[]> | null;
+} = {
+  data: null,
+  updatedAt: 0,
+  inFlight: null
+};
 
 const normalizeTagKey = (tag: string) => tag.trim().toLowerCase();
 
@@ -143,6 +207,292 @@ const markDictionaryTags = (tags: string[]) => {
     dictionaryTagCache.set(key, { exists: true, updatedAt: now });
     dictionaryTagSet.add(key);
   }
+};
+
+const normalizeGroupFilter = (value: unknown): Record<string, unknown> | null => {
+  if (value && typeof value === "object") {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === "object") {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      return null;
+    }
+  }
+  return null;
+};
+
+const parseTagTypeFilter = (filter: Record<string, unknown> | null) => {
+  const raw = filter?.tag_type;
+  if (!Array.isArray(raw)) return null;
+  const values = raw.map((value) => Number(value)).filter((value) => Number.isFinite(value));
+  return values.length > 0 ? values : null;
+};
+
+const matchesTagGroupFilter = (filter: Record<string, unknown> | null, tagType: number | null) => {
+  if (tagType === null) return false;
+  const tagTypes = parseTagTypeFilter(filter);
+  if (!tagTypes) return false;
+  return tagTypes.includes(tagType);
+};
+
+const fetchPromptTagGroups = async () => {
+  const now = Date.now();
+  if (promptTagGroupCache.data && now - promptTagGroupCache.updatedAt < TAG_GROUP_CACHE_TTL_MS) {
+    return promptTagGroupCache.data;
+  }
+  if (promptTagGroupCache.inFlight) return promptTagGroupCache.inFlight;
+
+  const run = (async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/prompt/tag-groups`, { cache: "no-store" });
+      const rawText = await response.text();
+      if (!response.ok) return [];
+      let payload: any = null;
+      try {
+        payload = rawText ? JSON.parse(rawText) : null;
+      } catch {
+        return [];
+      }
+      if (!payload || payload.ok !== true || !payload.data || !Array.isArray(payload.data.groups)) {
+        return [];
+      }
+      const groups = (payload.data.groups as any[])
+        .map((row) => {
+          const id = Number(row?.id);
+          const label = typeof row?.label === "string" ? row.label.trim() : "";
+          if (!Number.isFinite(id) || !label) return null;
+          const sortOrder = Number(row?.sort_order ?? row?.sortOrder ?? 0);
+          return {
+            id,
+            label,
+            sortOrder: Number.isFinite(sortOrder) ? sortOrder : 0,
+            filter: normalizeGroupFilter(row?.filter)
+          } satisfies TagGroup;
+        })
+        .filter((item): item is TagGroup => item !== null)
+        .sort((a, b) => a.sortOrder - b.sortOrder || a.id - b.id);
+      promptTagGroupCache.data = groups;
+      promptTagGroupCache.updatedAt = Date.now();
+      return groups;
+    } catch {
+      return [];
+    }
+  })();
+
+  promptTagGroupCache.inFlight = run;
+  return run.finally(() => {
+    if (promptTagGroupCache.inFlight === run) {
+      promptTagGroupCache.inFlight = null;
+    }
+  });
+};
+
+const parseTemplateTokens = (value: unknown): string[] => {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean);
+  }
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) {
+        return parsed
+          .filter((item): item is string => typeof item === "string")
+          .map((item) => item.trim())
+          .filter(Boolean);
+      }
+    } catch {
+      return value
+        .split(/[,\n\r\t]+/g)
+        .map((item) => item.trim())
+        .filter(Boolean);
+    }
+  }
+  return [];
+};
+
+const fetchPromptTemplates = async () => {
+  const now = Date.now();
+  if (promptTemplateCache.data && now - promptTemplateCache.updatedAt < TEMPLATE_CACHE_TTL_MS) {
+    return promptTemplateCache.data;
+  }
+  if (promptTemplateCache.inFlight) return promptTemplateCache.inFlight;
+
+  const run = (async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/prompt/templates`, { cache: "no-store" });
+      const rawText = await response.text();
+      if (!response.ok) return [];
+      let payload: any = null;
+      try {
+        payload = rawText ? JSON.parse(rawText) : null;
+      } catch {
+        return [];
+      }
+      if (!payload || payload.ok !== true || !payload.data || !Array.isArray(payload.data.templates)) {
+        return [];
+      }
+      const templates = (payload.data.templates as any[])
+        .map((row) => {
+          const id = Number(row?.id);
+          const name = typeof row?.name === "string" ? row.name.trim() : "";
+          const target = row?.target;
+          if (!Number.isFinite(id) || !name) return null;
+          if (target !== "positive" && target !== "negative" && target !== "both") return null;
+          const sortOrder = Number(row?.sort_order ?? row?.sortOrder ?? 0);
+          return {
+            id,
+            name,
+            target,
+            sortOrder: Number.isFinite(sortOrder) ? sortOrder : 0,
+            tokens: parseTemplateTokens(row?.tokens)
+          } satisfies PromptTemplate;
+        })
+        .filter((item): item is PromptTemplate => item !== null)
+        .sort((a, b) => a.sortOrder - b.sortOrder || a.id - b.id);
+      promptTemplateCache.data = templates;
+      promptTemplateCache.updatedAt = Date.now();
+      return templates;
+    } catch {
+      return [];
+    }
+  })();
+
+  promptTemplateCache.inFlight = run;
+  return run.finally(() => {
+    if (promptTemplateCache.inFlight === run) {
+      promptTemplateCache.inFlight = null;
+    }
+  });
+};
+
+const fetchPromptConflicts = async () => {
+  const now = Date.now();
+  if (promptConflictCache.data && now - promptConflictCache.updatedAt < CONFLICT_CACHE_TTL_MS) {
+    return promptConflictCache.data;
+  }
+  if (promptConflictCache.inFlight) return promptConflictCache.inFlight;
+
+  const run = (async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/prompt/conflicts`, { cache: "no-store" });
+      const rawText = await response.text();
+      if (!response.ok) return [];
+      let payload: any = null;
+      try {
+        payload = rawText ? JSON.parse(rawText) : null;
+      } catch {
+        return [];
+      }
+      if (!payload || payload.ok !== true || !payload.data || !Array.isArray(payload.data.conflicts)) {
+        return [];
+      }
+      const conflicts = (payload.data.conflicts as any[])
+        .map((row) => {
+          const id = Number(row?.id);
+          const a = typeof row?.a === "string" ? row.a.trim() : "";
+          const b = typeof row?.b === "string" ? row.b.trim() : "";
+          if (!Number.isFinite(id) || !a || !b) return null;
+          return {
+            id,
+            a,
+            b,
+            severity: typeof row?.severity === "string" ? row.severity : "warn",
+            message: typeof row?.message === "string" ? row.message : null
+          } satisfies PromptConflictRule;
+        })
+        .filter((item): item is PromptConflictRule => item !== null);
+      promptConflictCache.data = conflicts;
+      promptConflictCache.updatedAt = Date.now();
+      return conflicts;
+    } catch {
+      return [];
+    }
+  })();
+
+  promptConflictCache.inFlight = run;
+  return run.finally(() => {
+    if (promptConflictCache.inFlight === run) {
+      promptConflictCache.inFlight = null;
+    }
+  });
+};
+
+const getTagMetaCache = (key: string) => {
+  const cached = tagMetaCache.get(key);
+  if (!cached) return null;
+  if (Date.now() - cached.updatedAt > TAG_META_CACHE_TTL_MS) {
+    tagMetaCache.delete(key);
+    return null;
+  }
+  return cached;
+};
+
+const setTagMetaCache = (key: string, tagType: number | null) => {
+  tagMetaCache.set(key, { tagType, updatedAt: Date.now() });
+};
+
+const fetchTagMeta = (tag: string) => {
+  const key = normalizeTagKey(tag);
+  if (!key) return Promise.resolve();
+  const cached = getTagMetaCache(key);
+  if (cached) return Promise.resolve();
+  const inFlight = tagMetaInFlight.get(key);
+  if (inFlight) return inFlight;
+
+  const run = (async () => {
+    if (key.length <= 1) {
+      setTagMetaCache(key, null);
+      return;
+    }
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), DICTIONARY_LOOKUP_TIMEOUT_MS);
+    try {
+      const params = new URLSearchParams({ query: tag, limit: "5", offset: "0" });
+      const response = await fetch(`${API_BASE_URL}/api/tags/search?${params.toString()}`, {
+        cache: "no-store",
+        signal: controller.signal
+      });
+      const rawText = await response.text();
+      if (!response.ok) {
+        setTagMetaCache(key, null);
+        return;
+      }
+      let payload: any = null;
+      try {
+        payload = rawText ? JSON.parse(rawText) : null;
+      } catch {
+        setTagMetaCache(key, null);
+        return;
+      }
+      if (!payload || payload.ok !== true || !payload.data || !Array.isArray(payload.data.items)) {
+        setTagMetaCache(key, null);
+        return;
+      }
+      const items = payload.data.items as any[];
+      let matched = items.find((item) => typeof item?.tag === "string" && item.tag.toLowerCase() === key);
+      if (!matched && items.length > 0) matched = items[0];
+      const tagType =
+        matched && typeof matched.tagType === "number" && Number.isFinite(matched.tagType) ? matched.tagType : null;
+      setTagMetaCache(key, tagType);
+    } catch (err) {
+      if (err instanceof Error && err.name === "AbortError") return;
+      setTagMetaCache(key, null);
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  })();
+
+  tagMetaInFlight.set(key, run);
+  return run.finally(() => {
+    if (tagMetaInFlight.get(key) === run) {
+      tagMetaInFlight.delete(key);
+    }
+  });
 };
 
 const fetchDictionaryTagExists = (tag: string) => {
@@ -214,14 +564,107 @@ export default function PromptComposer({
   placeholder,
   suggestionLimit = 20,
   showClear = true,
-  onClear
+  onClear,
+  target = "positive"
 }: PromptComposerProps) {
   const tokens = useMemo(() => splitTokens(value), [value]);
   const uniqueTokens = useMemo(() => Array.from(new Set(tokens)), [tokens]);
-  const items = useMemo(
-    () => tokens.map((token, index) => ({ id: `token-${index}`, value: token })),
-    [tokens]
+  const [tagGroups, setTagGroups] = useState<TagGroup[]>([]);
+  const [groupFilter, setGroupFilter] = useState("all");
+  const [tagMetaVersion, setTagMetaVersion] = useState(0);
+  const [templates, setTemplates] = useState<PromptTemplate[]>([]);
+  const [conflicts, setConflicts] = useState<PromptConflictRule[]>([]);
+  const sortedGroups = useMemo(() => {
+    const next = [...tagGroups];
+    next.sort((a, b) => a.sortOrder - b.sortOrder || a.id - b.id);
+    return next;
+  }, [tagGroups]);
+  const groupLookup = useMemo(() => new Map(sortedGroups.map((group) => [group.id, group])), [sortedGroups]);
+  const overrideGroupRef = useRef<Map<string, number>>(new Map());
+  const resolveTokenGroup = useCallback(
+    (token: string) => {
+      const key = normalizeTagKey(token);
+      if (!key) {
+        return { id: "other", label: "Other", sortOrder: Number.MAX_SAFE_INTEGER };
+      }
+      const override = overrideGroupRef.current.get(key);
+      if (override !== undefined) {
+        const group = groupLookup.get(override);
+        if (group) {
+          return { id: group.id, label: group.label, sortOrder: group.sortOrder };
+        }
+      }
+      const tagMeta = getTagMetaCache(key);
+      const tagType = tagMeta?.tagType ?? null;
+      for (const group of sortedGroups) {
+        if (matchesTagGroupFilter(group.filter, tagType)) {
+          return { id: group.id, label: group.label, sortOrder: group.sortOrder };
+        }
+      }
+      return { id: "other", label: "Other", sortOrder: Number.MAX_SAFE_INTEGER };
+    },
+    [groupLookup, sortedGroups, tagMetaVersion]
   );
+  const tokenItems = useMemo(
+    () =>
+      tokens.map((token, index) => {
+        const group = resolveTokenGroup(token);
+        return { id: `token-${index}`, value: token, index, groupId: group.id, groupLabel: group.label };
+      }),
+    [resolveTokenGroup, tokens]
+  );
+  const displayItems = useMemo(() => {
+    if (groupFilter === "all") {
+      const buckets = new Map<number | "other", typeof tokenItems>();
+      for (const group of sortedGroups) {
+        buckets.set(group.id, []);
+      }
+      buckets.set("other", []);
+      for (const item of tokenItems) {
+        const key = typeof item.groupId === "number" ? item.groupId : "other";
+        const bucket = buckets.get(key) ?? buckets.get("other");
+        if (bucket) bucket.push(item);
+      }
+      const ordered: typeof tokenItems = [];
+      for (const group of sortedGroups) {
+        const bucket = buckets.get(group.id);
+        if (bucket && bucket.length > 0) {
+          ordered.push(...bucket);
+        }
+      }
+      const otherBucket = buckets.get("other");
+      if (otherBucket && otherBucket.length > 0) {
+        ordered.push(...otherBucket);
+      }
+      return ordered;
+    }
+    const selectedId = Number(groupFilter);
+    if (!Number.isFinite(selectedId)) return tokenItems;
+    return tokenItems.filter((item) => item.groupId === selectedId);
+  }, [groupFilter, sortedGroups, tokenItems]);
+  const tokenById = useMemo(() => new Map(tokenItems.map((item) => [item.id, item.value])), [tokenItems]);
+  const groupedDisplayItems = useMemo(() => {
+    if (groupFilter !== "all") {
+      return displayItems.map((item) => ({ kind: "chip" as const, item }));
+    }
+    const result: Array<
+      | { kind: "header"; key: string; label: string }
+      | { kind: "chip"; item: typeof displayItems[number] }
+    > = [];
+    let lastGroupId: string | number | null = null;
+    for (const item of displayItems) {
+      if (item.groupId !== lastGroupId) {
+        result.push({
+          kind: "header",
+          key: `header-${String(item.groupId)}-${item.index}`,
+          label: item.groupLabel
+        });
+        lastGroupId = item.groupId;
+      }
+      result.push({ kind: "chip", item });
+    }
+    return result;
+  }, [displayItems, groupFilter]);
   const translationCache = getTranslationCache();
   const inFlightRequests = getInFlightRequests();
   const [inputValue, setInputValue] = useState("");
@@ -240,6 +683,7 @@ export default function PromptComposer({
   const suggestRequestIdRef = useRef(0);
   const editCancelRef = useRef(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const templateMenuRef = useRef<HTMLDetailsElement | null>(null);
   const tokenCountRef = useRef(new Map<string, number>());
   const tagRequestIdRef = useRef(new Map<string, number>());
   const lookupRequestIdRef = useRef(0);
@@ -261,6 +705,51 @@ export default function PromptComposer({
       if (dedupNoticeTimerRef.current) {
         clearTimeout(dedupNoticeTimerRef.current);
       }
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchPromptTagGroups()
+      .then((groups) => {
+        if (cancelled) return;
+        setTagGroups(groups);
+      })
+      .catch(() => {
+        if (!cancelled) setTagGroups([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchPromptTemplates()
+      .then((items) => {
+        if (cancelled) return;
+        setTemplates(items);
+      })
+      .catch(() => {
+        if (!cancelled) setTemplates([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchPromptConflicts()
+      .then((items) => {
+        if (cancelled) return;
+        setConflicts(items);
+      })
+      .catch(() => {
+        if (!cancelled) setConflicts([]);
+      });
+    return () => {
+      cancelled = true;
     };
   }, []);
 
@@ -318,11 +807,35 @@ export default function PromptComposer({
   }, [translationCache]);
 
   useEffect(() => {
+    let cancelled = false;
+    const uniqueTokens = Array.from(new Set(tokens.map((token) => normalizeTagKey(token)).filter((key) => key.length > 0)));
+    if (uniqueTokens.length === 0) return undefined;
+    const pending = uniqueTokens.filter((key) => getTagMetaCache(key) === null);
+    if (pending.length === 0) return undefined;
+    Promise.allSettled(pending.map((key) => fetchTagMeta(key))).then(() => {
+      if (!cancelled) {
+        setTagMetaVersion((prev) => prev + 1);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [tokens]);
+
+  useEffect(() => {
     if (editingIndex !== null && editingIndex >= tokens.length) {
       setEditingIndex(null);
       setEditingValue("");
     }
   }, [editingIndex, tokens.length]);
+
+  useEffect(() => {
+    if (groupFilter === "all") return;
+    const id = Number(groupFilter);
+    if (!Number.isFinite(id) || !tagGroups.some((group) => group.id === id)) {
+      setGroupFilter("all");
+    }
+  }, [groupFilter, tagGroups]);
 
   const queuePersistTranslations = useCallback((translations: Record<string, string>) => {
     const tags = Object.keys(translations);
@@ -906,21 +1419,189 @@ export default function PromptComposer({
     return { hasDuplicates: removedCount > 0, removedCount };
   }, [tokens]);
 
-  const handleDedup = () => {
-    if (!dedupState.hasDuplicates) return;
-    const result = dedupTokens(tokens);
-    if (result.removedCount === 0) return;
-    updateTokens(result.tokens);
-    setDedupNotice(`Removed ${result.removedCount} duplicate${result.removedCount === 1 ? "" : "s"}`);
+  const applicableTemplates = useMemo(
+    () => templates.filter((template) => template.target === "both" || template.target === target),
+    [target, templates]
+  );
+
+  const conflictMatches = useMemo(() => {
+    if (conflicts.length === 0 || tokens.length === 0) return [];
+    const tokenKeys = new Set(tokens.map(normalizeTokenKey).filter((key) => key.length > 0));
+    if (tokenKeys.size === 0) return [];
+    return conflicts.filter((rule) => {
+      const aKey = normalizeTokenKey(rule.a);
+      const bKey = normalizeTokenKey(rule.b);
+      return aKey.length > 0 && bKey.length > 0 && tokenKeys.has(aKey) && tokenKeys.has(bKey);
+    });
+  }, [conflicts, tokens]);
+
+  const conflictTagKeys = useMemo(() => {
+    const keys = new Set<string>();
+    for (const rule of conflictMatches) {
+      const aKey = normalizeTokenKey(rule.a);
+      const bKey = normalizeTokenKey(rule.b);
+      if (aKey) keys.add(aKey);
+      if (bKey) keys.add(bKey);
+    }
+    return keys;
+  }, [conflictMatches]);
+
+  const conflictMessages = useMemo(() => {
+    const messages: string[] = [];
+    for (const rule of conflictMatches) {
+      const text = rule.message && rule.message.trim().length > 0 ? rule.message.trim() : `${rule.a} × ${rule.b}`;
+      if (!messages.includes(text)) {
+        messages.push(text);
+      }
+    }
+    return messages;
+  }, [conflictMatches]);
+
+  const canApplyGroups = sortedGroups.length > 0 && tokens.length > 1;
+
+  const pushNotice = useCallback((message: string) => {
+    setDedupNotice(message);
     if (dedupNoticeTimerRef.current) {
       clearTimeout(dedupNoticeTimerRef.current);
     }
     dedupNoticeTimerRef.current = setTimeout(() => {
       setDedupNotice(null);
     }, 2000);
+  }, []);
+
+  const handleDedup = () => {
+    if (!dedupState.hasDuplicates) return;
+    const result = dedupTokens(tokens);
+    if (result.removedCount === 0) return;
+    updateTokens(result.tokens);
+    pushNotice(`Removed ${result.removedCount} duplicate${result.removedCount === 1 ? "" : "s"}`);
     requestAnimationFrame(() => {
       inputRef.current?.focus();
     });
+  };
+
+  const closeTemplateMenu = () => {
+    if (templateMenuRef.current) {
+      templateMenuRef.current.removeAttribute("open");
+    }
+  };
+
+  const handleApplyTemplate = (template: PromptTemplate) => {
+    if (template.tokens.length === 0) return;
+    const next = dedupTokens([...tokens, ...template.tokens]);
+    updateTokens(next.tokens);
+    if (next.removedCount > 0) {
+      pushNotice(`Removed ${next.removedCount} duplicate${next.removedCount === 1 ? "" : "s"}`);
+    }
+    closeTemplateMenu();
+  };
+
+  const handleAssignGroup = async (token: string, groupId: number | null, event?: MouseEvent<HTMLButtonElement>) => {
+    event?.stopPropagation();
+    const details = event?.currentTarget.closest("details");
+    if (details) {
+      details.removeAttribute("open");
+    }
+    const key = normalizeTagKey(token);
+    if (!key) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/prompt/tag-group-overrides/${encodeURIComponent(token)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ groupId }),
+        cache: "no-store"
+      });
+      const text = await response.text();
+      if (!response.ok) {
+        let message = `HTTP ${response.status}`;
+        try {
+          const payload = text ? JSON.parse(text) : null;
+          message = payload?.error?.message || message;
+        } catch {
+          // ignore parse error
+        }
+        pushNotice(message);
+        return;
+      }
+      if (groupId === null) {
+        overrideGroupRef.current.delete(key);
+      } else {
+        overrideGroupRef.current.set(key, groupId);
+      }
+      setTagMetaVersion((prev) => prev + 1);
+    } catch (err) {
+      const message =
+        err instanceof Error && err.name === "AbortError" ? "timeout" : err instanceof Error ? err.message : "failed";
+      pushNotice(message);
+    }
+  };
+
+  const renderAssignMenu = (token: string) => (
+    <details className="relative">
+      <summary
+        onPointerDown={(event) => event.stopPropagation()}
+        className="flex h-7 w-7 items-center justify-center rounded-full text-[11px] text-slate-300 opacity-0 transition hover:bg-slate-700/40 hover:text-slate-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/60 group-hover:opacity-100"
+        aria-label="Assign group"
+      >
+        ︙
+      </summary>
+      <div
+        onPointerDown={(event) => event.stopPropagation()}
+        className="absolute right-0 z-30 mt-2 min-w-[180px] rounded-md border border-slate-800 bg-slate-950 p-2 text-xs text-slate-200 shadow-lg"
+      >
+        <div className="px-2 pb-2 text-[10px] uppercase tracking-wide text-slate-500">Assign group</div>
+        {sortedGroups.length === 0 ? (
+          <div className="px-2 py-1 text-slate-500">No groups</div>
+        ) : (
+          <>
+            <button
+              type="button"
+              onClick={(event) => handleAssignGroup(token, null, event)}
+              className="flex w-full items-center gap-2 rounded-md px-2 py-1 text-left transition hover:bg-slate-800"
+            >
+              Other
+            </button>
+            {sortedGroups.map((group) => (
+              <button
+                key={group.id}
+                type="button"
+                onClick={(event) => handleAssignGroup(token, group.id, event)}
+                className="flex w-full items-center gap-2 rounded-md px-2 py-1 text-left transition hover:bg-slate-800"
+              >
+                {group.label}
+              </button>
+            ))}
+          </>
+        )}
+      </div>
+    </details>
+  );
+
+  const handleApplyGroups = () => {
+    if (sortedGroups.length === 0 || tokens.length <= 1) return;
+    const buckets = new Map<number | "other", string[]>();
+    for (const group of sortedGroups) {
+      buckets.set(group.id, []);
+    }
+    buckets.set("other", []);
+    for (const token of tokens) {
+      const resolved = resolveTokenGroup(token);
+      const key = typeof resolved.id === "number" ? resolved.id : "other";
+      const bucket = buckets.get(key) ?? buckets.get("other");
+      if (bucket) bucket.push(token);
+    }
+    const next: string[] = [];
+    for (const group of sortedGroups) {
+      const bucket = buckets.get(group.id);
+      if (bucket && bucket.length > 0) {
+        next.push(...bucket);
+      }
+    }
+    const otherBucket = buckets.get("other");
+    if (otherBucket && otherBucket.length > 0) {
+      next.push(...otherBucket);
+    }
+    updateTokens(next);
   };
 
   const handleRetranslateToken = (tag: string) => {
@@ -945,12 +1626,23 @@ export default function PromptComposer({
   };
 
   const handleDragEnd = (event: DragEndEvent) => {
+    if (groupFilter !== "all") {
+      setActiveId(null);
+      setOverId(null);
+      return;
+    }
     const { active, over } = event;
     if (over && active.id !== over.id) {
-      const fromIndex = items.findIndex((item) => item.id === active.id);
-      const toIndex = items.findIndex((item) => item.id === over.id);
+      const fromIndex = displayItems.findIndex((item) => item.id === active.id);
+      const toIndex = displayItems.findIndex((item) => item.id === over.id);
       if (fromIndex !== -1 && toIndex !== -1) {
-        updateTokens(arrayMove(tokens, fromIndex, toIndex));
+        const order = arrayMove(
+          displayItems.map((item) => item.id),
+          fromIndex,
+          toIndex
+        );
+        const next = order.map((id) => tokenById.get(id)).filter((value): value is string => typeof value === "string");
+        updateTokens(next);
       }
     }
     setActiveId(null);
@@ -962,8 +1654,10 @@ export default function PromptComposer({
     setOverId(null);
   };
 
-  const activeIndex = activeId ? items.findIndex((item) => item.id === activeId) : -1;
-  const overIndex = overId ? items.findIndex((item) => item.id === overId) : -1;
+  const dragEnabled = groupFilter === "all";
+
+  const activeIndex = activeId ? displayItems.findIndex((item) => item.id === activeId) : -1;
+  const overIndex = overId ? displayItems.findIndex((item) => item.id === overId) : -1;
   const insertPosition =
     activeIndex !== -1 && overIndex !== -1 && activeIndex !== overIndex
       ? activeIndex < overIndex
@@ -971,20 +1665,24 @@ export default function PromptComposer({
         : "before"
       : null;
 
-  const activeItem = activeId ? items.find((item) => item.id === activeId) : null;
+  const activeItem = activeId ? displayItems.find((item) => item.id === activeId) : null;
 
   const SortablePromptChip = ({
     id,
     value,
     index,
     insertPosition,
-    disableDrag
+    disableDrag,
+    menu,
+    warning
   }: {
     id: string;
     value: string;
     index: number;
     insertPosition: "before" | "after" | null;
     disableDrag: boolean;
+    menu?: ReactNode;
+    warning?: boolean;
   }) => {
     const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
       id,
@@ -997,13 +1695,9 @@ export default function PromptComposer({
     };
     const dragProps = disableDrag ? {} : { ...attributes, ...listeners };
     const dragClass = disableDrag ? "relative" : "relative cursor-grab active:cursor-grabbing";
+    const warningClass = warning ? "border-amber-400/50 bg-amber-500/10" : "";
     return (
-      <div
-        ref={setNodeRef}
-        style={style}
-        className={dragClass}
-        {...dragProps}
-      >
+      <div ref={setNodeRef} style={style} className={dragClass} {...dragProps}>
         {insertPosition === "before" && (
           <span className="pointer-events-none absolute -left-1 top-1 bottom-1 w-0.5 rounded bg-emerald-400" />
         )}
@@ -1021,6 +1715,8 @@ export default function PromptComposer({
           onRemove={() => removeToken(index)}
           translation={translationState.get(value) ?? { status: "pending" }}
           onRetranslate={() => handleRetranslateToken(value)}
+          menu={menu}
+          rootProps={{ className: warningClass }}
         />
       </div>
     );
@@ -1028,9 +1724,58 @@ export default function PromptComposer({
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <label className="text-sm text-slate-300">{label}</label>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] text-slate-500">Group</span>
+            <select
+              value={groupFilter}
+              onChange={(event) => setGroupFilter(event.target.value)}
+              className="rounded-md border border-slate-700 bg-slate-950 px-2 py-1 text-[11px] text-slate-200"
+            >
+              <option value="all">All</option>
+              {sortedGroups.map((group) => (
+                <option key={group.id} value={String(group.id)}>
+                  {group.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <button
+            type="button"
+            onClick={handleApplyGroups}
+            disabled={!canApplyGroups}
+            className="rounded-md border border-slate-700 px-2 py-1 text-[11px] text-slate-300 transition hover:border-emerald-400/60 hover:text-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Apply
+          </button>
+          <details ref={templateMenuRef} className="relative">
+            <summary
+              className={`rounded-md border border-slate-700 px-2 py-1 text-[11px] text-slate-300 transition hover:border-emerald-400/60 hover:text-slate-100 ${
+                applicableTemplates.length === 0 ? "pointer-events-none opacity-50" : ""
+              }`}
+            >
+              Templates
+            </summary>
+            <div className="absolute right-0 z-30 mt-2 min-w-[200px] rounded-md border border-slate-800 bg-slate-950 p-2 text-xs text-slate-200 shadow-lg">
+              {applicableTemplates.length === 0 ? (
+                <div className="px-2 py-1 text-slate-500">No templates</div>
+              ) : (
+                applicableTemplates.map((template) => (
+                  <button
+                    key={template.id}
+                    type="button"
+                    onClick={() => handleApplyTemplate(template)}
+                    className="flex w-full items-center justify-between gap-2 rounded-md px-2 py-2 text-left transition hover:bg-slate-800"
+                  >
+                    <span className="truncate">{template.name}</span>
+                    <span className="text-[10px] uppercase tracking-wide text-slate-500">{template.target}</span>
+                  </button>
+                ))
+              )}
+            </div>
+          </details>
           <button
             type="button"
             onClick={handleDedup}
@@ -1074,7 +1819,7 @@ export default function PromptComposer({
         onDragEnd={handleDragEnd}
         onDragCancel={handleDragCancel}
       >
-        <SortableContext items={items.map((item) => item.id)} strategy={rectSortingStrategy}>
+        <SortableContext items={displayItems.map((item) => item.id)} strategy={rectSortingStrategy}>
           <div
             className={`flex flex-wrap items-center gap-2 rounded-md border border-slate-700 bg-slate-900 px-3 py-2 ${
               activeId ? "ring-1 ring-emerald-400/40" : ""
@@ -1083,16 +1828,24 @@ export default function PromptComposer({
             {tokens.length === 0 && inputValue.length === 0 && (
               <span className="text-xs text-slate-500">{placeholder ?? "Type and press Enter"}</span>
             )}
-            {items.map((item, index) => (
-              <SortablePromptChip
-                key={item.id}
-                id={item.id}
-                value={item.value}
-                index={index}
-                insertPosition={overId === item.id ? insertPosition : null}
-                disableDrag={editingIndex === index}
-              />
-            ))}
+            {groupedDisplayItems.map((entry) =>
+              entry.kind === "header" ? (
+                <div key={entry.key} className="w-full pt-2 text-[11px] uppercase tracking-wide text-slate-500">
+                  {entry.label}
+                </div>
+              ) : (
+                <SortablePromptChip
+                  key={entry.item.id}
+                  id={entry.item.id}
+                  value={entry.item.value}
+                  index={entry.item.index}
+                  insertPosition={overId === entry.item.id ? insertPosition : null}
+                  disableDrag={!dragEnabled || editingIndex === entry.item.index}
+                  warning={conflictTagKeys.has(normalizeTokenKey(entry.item.value))}
+                  menu={renderAssignMenu(entry.item.value)}
+                />
+              )
+            )}
             <div className="relative min-w-[160px] flex-1">
               <input
                 ref={inputRef}
@@ -1147,6 +1900,11 @@ export default function PromptComposer({
           ) : null}
         </DragOverlay>
       </DndContext>
+      {conflictMessages.length > 0 && (
+        <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+          <span className="font-semibold">Potential conflicts:</span> {conflictMessages.join(" / ")}
+        </div>
+      )}
       {showRaw && (
         <textarea
           readOnly
