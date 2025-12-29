@@ -194,6 +194,7 @@ export const api = {
   fetchLora: (id: string) => request<{ lora: Lora }>(`/api/loras/${id}`),
   createLora: (payload: {
     name: string;
+    fileName?: string | null;
     triggerWords?: string[];
     recommendedWeightMin?: number | null;
     recommendedWeightMax?: number | null;
@@ -209,6 +210,7 @@ export const api = {
     id: string,
     payload: Partial<{
       name: string;
+      fileName: string | null;
       triggerWords: string[];
       recommendedWeightMin: number | null;
       recommendedWeightMax: number | null;

@@ -60,7 +60,7 @@ const splitTokens = (value: string) =>
 
 const joinTokens = (tokens: string[]) => tokens.join(", ");
 
-const normalizeTokenKey = (value: string) => value.trim().replace(/\s+/g, " ").toLowerCase();
+export const normalizeTokenKey = (value: string) => value.trim().replace(/\s+/g, " ").toLowerCase();
 
 const dedupTokens = (tokens: string[]) => {
   const seen = new Set<string>();

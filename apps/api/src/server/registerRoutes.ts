@@ -51,13 +51,11 @@ const COMFY_OBJECT_INFO_CACHE_TTL_MS = 60_000;
 const COMFY_REQUEST_TIMEOUT_MS = 8000;
 const COMFY_HISTORY_GRACE_MS = Number.isFinite(Number(process.env.COMFY_HISTORY_GRACE_MS))
   ? Number(process.env.COMFY_HISTORY_GRACE_MS)
-  : 300_000;
+  : 600_000;
 const COMFY_TAGGER_POLL_INTERVAL_MS = 2000;
 const COMFY_TAGGER_POLL_TIMEOUT_MS = 60_000;
 const { root: WORKSHOP_ROOT, recipeThumbsDir: RECIPE_THUMBS_DIR, loraThumbsDir: LORA_THUMBS_DIR } = getWorkshopPaths();
 const {
-  initImagesDir: COMFY_INIT_IMAGES_DIR,
-  controlImagesDir: COMFY_CONTROL_IMAGES_DIR,
   taggerInputsDir: COMFY_TAGGER_INPUTS_DIR
 } = getComfyPaths();
 const {
@@ -80,6 +78,64 @@ const resolveImageExtension = (file: Express.Multer.File) => {
   const ext = ALLOWED_IMAGE_MIME.get(file.mimetype) ?? path.extname(file.originalname).replace(/^\.+/, "");
   if (!ext) return ".bin";
   return ext.startsWith(".") ? ext : `.${ext}`;
+};
+
+const COMFY_INPUT_SUBDIRS = new Set(["tagger_inputs", "init_images", "control_images"]);
+
+const normalizeComfyInputRoot = (value: string) => {
+  const root = path.resolve(value);
+  const leaf = path.basename(root).toLowerCase();
+  if (COMFY_INPUT_SUBDIRS.has(leaf)) {
+    return path.dirname(root);
+  }
+  return root;
+};
+
+const resolveComfyInputRoot = () => {
+  const config = comfyService.getConfig();
+  const args = config.extraArgs ?? [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === "--input-directory" && args[i + 1]) {
+      return normalizeComfyInputRoot(args[i + 1]);
+    }
+    if (arg.startsWith("--input-directory=")) {
+      return normalizeComfyInputRoot(arg.slice("--input-directory=".length));
+    }
+  }
+  if (config.dir) {
+    return normalizeComfyInputRoot(path.resolve(config.dir, "input"));
+  }
+  return normalizeComfyInputRoot(path.resolve(path.dirname(COMFY_TAGGER_INPUTS_DIR)));
+};
+
+const resolveComfyDefaultInputRoot = () => {
+  const config = comfyService.getConfig();
+  if (!config.dir) return null;
+  return normalizeComfyInputRoot(path.resolve(config.dir, "input"));
+};
+
+const resolveComfyInputPaths = (inputRoot: string, subdir: string, filename: string) => {
+  const root = normalizeComfyInputRoot(inputRoot);
+  return { dir: path.join(root, subdir), name: path.posix.join(subdir, filename) };
+};
+
+const writeComfyInputFile = async (subdir: string, filename: string, buffer: Buffer) => {
+  const inputRoot = resolveComfyInputRoot();
+  const primary = resolveComfyInputPaths(inputRoot, subdir, filename);
+  await fs.promises.mkdir(primary.dir, { recursive: true });
+  await fs.promises.writeFile(path.join(primary.dir, filename), buffer);
+
+  const fallbackRoot = resolveComfyDefaultInputRoot();
+  if (fallbackRoot && path.resolve(fallbackRoot) !== path.resolve(inputRoot)) {
+    const fallback = resolveComfyInputPaths(fallbackRoot, subdir, filename);
+    if (path.resolve(fallback.dir) !== path.resolve(primary.dir)) {
+      await fs.promises.mkdir(fallback.dir, { recursive: true });
+      await fs.promises.writeFile(path.join(fallback.dir, filename), buffer);
+    }
+  }
+
+  return primary.name;
 };
 
 const encodeMediaKey = (value: string) =>
@@ -472,6 +528,7 @@ type ComfyOutputImage = {
   filename: string;
   subfolder?: string | null;
   type?: string | null;
+  nodeId?: string | null;
 };
 
 type ComfyTemplateDefaults = {
@@ -690,6 +747,46 @@ const getComfyImage2iDefaults = async (): Promise<ComfyImage2iDefaults> => {
   return comfyImage2iDefaultsCache;
 };
 
+const asRecord = (value: unknown): Record<string, unknown> | null => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+};
+
+const readOptionalString = (value: unknown) => {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+};
+
+const readOptionalNumber = (value: unknown) => {
+  if (value === undefined || value === null || value === "") return undefined;
+  const num = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(num) ? num : undefined;
+};
+
+const readOptionalBoolean = (value: unknown) => {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "1", "yes", "on"].includes(normalized)) return true;
+    if (["false", "0", "no", "off"].includes(normalized)) return false;
+  }
+  return undefined;
+};
+
+const getRecipeComfyConfig = (variables: unknown): Record<string, unknown> => {
+  const record = asRecord(variables);
+  if (!record) return {};
+  const candidates = ["comfy", "comfyRun", "comfy_run", "comfyParams", "comfy_params"];
+  for (const key of candidates) {
+    const nested = asRecord(record[key]);
+    if (nested) return nested;
+  }
+  return record;
+};
+
 const updateLoraStack = (inputs: Record<string, any>, loras: { name: string; weight: number; enabled: boolean }[]) => {
   const enabled = loras.filter((item) => item.enabled && item.name.trim().length > 0);
   const maxSlots = 50;
@@ -799,6 +896,170 @@ const applyWorkflowOverrides = (
   }
 };
 
+type ComfyRunCreateResult =
+  | { ok: true; run: any }
+  | { ok: false; error: { status: number; message: string; details?: Record<string, unknown> } };
+
+const createComfyRun = async (
+  input: ComfyRunCreateInput,
+  options: {
+    controlnetFile?: Express.Multer.File;
+    initImageFile?: Express.Multer.File;
+    controlnetImageName?: string | null;
+    initImageName?: string | null;
+    recipeId?: string | null;
+    recipeSnapshot?: Record<string, unknown> | null;
+  }
+): Promise<ComfyRunCreateResult> => {
+  const runId = randomUUID();
+  let controlnetImageName = options.controlnetImageName ?? null;
+  let initImageName = options.initImageName ?? null;
+
+  if (options.initImageFile) {
+    const safeExt = resolveImageExtension(options.initImageFile);
+    const initFile = `init_${runId}_${Date.now()}${safeExt}`;
+    initImageName = await writeComfyInputFile("init_images", initFile, options.initImageFile.buffer);
+  }
+
+  if (options.controlnetFile && input.controlnetEnabled) {
+    const safeExt = resolveImageExtension(options.controlnetFile);
+    const controlFile = `controlnet_${runId}_${Date.now()}${safeExt}`;
+    controlnetImageName = await writeComfyInputFile("control_images", controlFile, options.controlnetFile.buffer);
+  }
+
+  const useImage2i = input.workflowId === "base_image2i";
+  if (useImage2i && !initImageName) {
+    return { ok: false, error: { status: 400, message: "initImage is required for image2i" } };
+  }
+
+  let workflow: Record<string, any>;
+  let resolvedSeed: number | null = null;
+  const ksamplerForWorkflow = input.ksampler ? { ...input.ksampler } : undefined;
+  if (ksamplerForWorkflow?.seed !== undefined && ksamplerForWorkflow.seed === -1) {
+    resolvedSeed = randomInt(0, 2147483648);
+    ksamplerForWorkflow.seed = resolvedSeed;
+  }
+  const templatePath = useImage2i ? COMFY_WORKFLOW_IMAGE2I_PATH : COMFY_WORKFLOW_TEXT2I_PATH;
+  try {
+    workflow = await readWorkflowTemplate(templatePath);
+    applyWorkflowOverrides(workflow, {
+      ...input,
+      mode: useImage2i ? "image2i" : "text2i",
+      ksampler: ksamplerForWorkflow,
+      loras: input.loras.map((item) => ({
+        name: item.name,
+        weight: item.weight ?? 1,
+        enabled: item.enabled ?? true
+      })),
+      controlnetImageName,
+      initImageName
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      error: { status: 500, message: "Failed to prepare workflow", details: { error: err instanceof Error ? err.message : String(err) } }
+    };
+  }
+
+  const requestPayload: Record<string, unknown> = {
+    workflowId: input.workflowId,
+    positive: input.positive,
+    negative: input.negative,
+    ckptName: input.ckptName,
+    width: input.width,
+    height: input.height,
+    loras: input.loras,
+    controlnetEnabled: input.controlnetEnabled,
+    controlnetModel: input.controlnetModel ?? null,
+    preprocessorEnabled: input.preprocessorEnabled,
+    preprocessor: input.preprocessor ?? null,
+    controlnetStrength: input.controlnetStrength ?? null,
+    ksampler: input.ksampler ?? null,
+    ...(resolvedSeed !== null ? { ksamplerResolved: { seed: resolvedSeed } } : {}),
+    controlnetImage: controlnetImageName ?? null,
+    ...(initImageName ? { initImage: initImageName } : {})
+  };
+  if (options.recipeId) requestPayload.recipeId = options.recipeId;
+  if (options.recipeSnapshot) requestPayload.recipeSnapshot = options.recipeSnapshot;
+
+  await pool.query(
+    `INSERT INTO comfy_runs (id, status, prompt_id, request_json, workflow_json, history_json, error_message, recipe_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     RETURNING *`,
+    [runId, "created", null, requestPayload, workflow, null, null, options.recipeId ?? null]
+  );
+
+  const promptResult = await fetchComfyJson(
+    "/prompt",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: workflow })
+    },
+    COMFY_REQUEST_TIMEOUT_MS
+  );
+
+  if (!promptResult.ok) {
+    const errorMessage = promptResult.error.message;
+    await pool.query(
+      `UPDATE comfy_runs
+       SET status = $1, error_message = $2, updated_at = NOW(), finished_at = NOW()
+       WHERE id = $3
+       RETURNING *`,
+      ["failed", errorMessage, runId]
+    );
+    const status = errorMessage === "timeout" ? 504 : 502;
+    return {
+      ok: false,
+      error: { status, message: errorMessage, details: { runId, ...(promptResult.error.details ? { details: promptResult.error.details } : {}) } }
+    };
+  }
+
+  if (promptResult.data && typeof promptResult.data === "object" && (promptResult.data as any).error) {
+    const errorValue = (promptResult.data as any).error;
+    const errorMessage =
+      errorValue && typeof errorValue === "object" && typeof errorValue.message === "string"
+        ? errorValue.message
+        : typeof errorValue === "string"
+          ? errorValue
+          : "prompt_error";
+    await pool.query(
+      `UPDATE comfy_runs
+       SET status = $1, error_message = $2, updated_at = NOW(), finished_at = NOW()
+       WHERE id = $3
+       RETURNING *`,
+      ["failed", errorMessage, runId]
+    );
+    return { ok: false, error: { status: 502, message: errorMessage, details: { runId } } };
+  }
+
+  const promptId =
+    promptResult.data && typeof promptResult.data === "object" && (promptResult.data as any).prompt_id
+      ? String((promptResult.data as any).prompt_id)
+      : "";
+
+  if (!promptId) {
+    await pool.query(
+      `UPDATE comfy_runs
+       SET status = $1, error_message = $2, updated_at = NOW(), finished_at = NOW()
+       WHERE id = $3
+       RETURNING *`,
+      ["failed", "prompt_id_missing", runId]
+    );
+    return { ok: false, error: { status: 502, message: "prompt_id_missing", details: { runId } } };
+  }
+
+  const updated = await pool.query(
+    `UPDATE comfy_runs
+     SET status = $1, prompt_id = $2, updated_at = NOW(), started_at = NOW()
+     WHERE id = $3
+     RETURNING *`,
+    ["queued", promptId, runId]
+  );
+
+  return { ok: true, run: updated.rows[0] };
+};
+
 const resolveQueueStatus = (queueData: unknown, promptId: string): "queued" | "running" | null => {
   if (!queueData || typeof queueData !== "object") return null;
   const record = queueData as Record<string, unknown>;
@@ -826,48 +1087,184 @@ const resolveHistoryEntry = (historyData: unknown, promptId: string) => {
   return null;
 };
 
-const extractHistoryOutputs = (historyEntry: Record<string, unknown> | null): ComfyOutputImage[] => {
+const resolveWorkflowOutputNodeInfo = (
+  workflow: unknown
+): {
+  outputNodeIds: Set<string>;
+  preprocessorOutputNodeIds: Set<string>;
+  preprocessorPreviewNodeIds: Set<string>;
+} | null => {
+  if (!workflow || typeof workflow !== "object" || Array.isArray(workflow)) return null;
+  const record = workflow as Record<string, unknown>;
+  const outputIds = new Set<string>();
+  const preprocessorOutputIds = new Set<string>();
+  const preprocessorPreviewIds = new Set<string>();
+  const preprocessorClassPattern = /preprocessor/i;
+  const samplerClassPattern = /ksampler/i;
+  const previewClassPattern = /previewimage/i;
+  const nodes = record as Record<string, any>;
+
+  const getInputNodeIds = (node: any) => {
+    if (!node || typeof node !== "object") return [] as string[];
+    const inputs = node.inputs;
+    if (!inputs || typeof inputs !== "object") return [] as string[];
+    const ids: string[] = [];
+    for (const value of Object.values(inputs)) {
+      if (Array.isArray(value) && typeof value[0] === "string") {
+        ids.push(value[0]);
+      }
+    }
+    return ids;
+  };
+
+  const analyzeUpstream = (startId: string) => {
+    const visited = new Set<string>();
+    const stack = [startId];
+    let hasPreprocessor = false;
+    let hasSampler = false;
+    while (stack.length > 0) {
+      const currentId = stack.pop()!;
+      if (visited.has(currentId)) continue;
+      visited.add(currentId);
+      const node = nodes[currentId];
+      if (!node || typeof node !== "object") continue;
+      const classType = node.class_type;
+      if (typeof classType === "string") {
+        if (preprocessorClassPattern.test(classType)) {
+          hasPreprocessor = true;
+        }
+        if (samplerClassPattern.test(classType)) {
+          hasSampler = true;
+        }
+      }
+      const nextIds = getInputNodeIds(node);
+      for (const nextId of nextIds) {
+        if (!visited.has(nextId)) {
+          stack.push(nextId);
+        }
+      }
+    }
+    return { hasPreprocessor, hasSampler };
+  };
+
+  for (const [nodeId, node] of Object.entries(record)) {
+    if (!node || typeof node !== "object") continue;
+    const classType = (node as any).class_type;
+    if (typeof classType !== "string") continue;
+    if (/saveimage/i.test(classType)) {
+      outputIds.add(nodeId);
+      const analysis = analyzeUpstream(nodeId);
+      if (analysis.hasPreprocessor && !analysis.hasSampler) {
+        preprocessorOutputIds.add(nodeId);
+      }
+    }
+    if (previewClassPattern.test(classType)) {
+      const analysis = analyzeUpstream(nodeId);
+      if (analysis.hasPreprocessor && !analysis.hasSampler) {
+        preprocessorPreviewIds.add(nodeId);
+      }
+    }
+  }
+  return outputIds.size > 0
+    ? {
+        outputNodeIds: outputIds,
+        preprocessorOutputNodeIds: preprocessorOutputIds,
+        preprocessorPreviewNodeIds: preprocessorPreviewIds
+      }
+    : null;
+};
+
+const extractHistoryOutputs = (
+  historyEntry: Record<string, unknown> | null,
+  outputNodeIds?: Set<string> | null,
+  excludeNodeIds?: Set<string> | null,
+  includeNonOutputNodeIds?: Set<string> | null
+): ComfyOutputImage[] => {
   if (!historyEntry) return [];
   const outputs = (historyEntry.outputs ?? historyEntry.output ?? historyEntry.result) as unknown;
   if (!outputs) return [];
   const images: ComfyOutputImage[] = [];
   const visited = new Set<object>();
 
-  const walk = (value: unknown) => {
+  const walk = (value: unknown, nodeId?: string | null) => {
     if (!value || typeof value !== "object") return;
     if (visited.has(value as object)) return;
     visited.add(value as object);
 
     if (Array.isArray(value)) {
-      for (const item of value) walk(item);
+      for (const item of value) walk(item, nodeId);
       return;
     }
 
     const record = value as Record<string, unknown>;
     if (typeof record.filename === "string") {
+      if (excludeNodeIds && nodeId && excludeNodeIds.has(nodeId)) {
+        return;
+      }
+      if (
+        outputNodeIds &&
+        nodeId &&
+        !outputNodeIds.has(nodeId) &&
+        !(includeNonOutputNodeIds && includeNonOutputNodeIds.has(nodeId))
+      ) {
+        return;
+      }
+      const subfolder = typeof record.subfolder === "string" ? record.subfolder : null;
+      const typeRaw = typeof record.type === "string" ? record.type : null;
+      const typeNormalized =
+        typeRaw || (subfolder && subfolder.toLowerCase() === "output" ? "output" : null);
       images.push({
         filename: record.filename,
-        subfolder: typeof record.subfolder === "string" ? record.subfolder : null,
-        type: typeof record.type === "string" ? record.type : null
+        subfolder,
+        type: typeNormalized,
+        nodeId: nodeId ?? null
       });
     }
 
     for (const item of Object.values(record)) {
-      walk(item);
+      walk(item, nodeId);
     }
   };
 
-  walk(outputs);
+  if (outputs && typeof outputs === "object" && !Array.isArray(outputs)) {
+    for (const [nodeId, value] of Object.entries(outputs as Record<string, unknown>)) {
+      walk(value, nodeId);
+    }
+  } else {
+    walk(outputs, null);
+  }
 
-  const unique = new Map<string, ComfyOutputImage>();
-  for (const image of images) {
-    const key = `${image.filename}|${image.subfolder ?? ""}|${image.type ?? ""}`;
-    if (!unique.has(key)) {
-      unique.set(key, image);
+  const isOutputImage = (image: ComfyOutputImage) => {
+    const type = (image.type || "").toLowerCase();
+    const subfolder = (image.subfolder || "").toLowerCase();
+    return type === "output" || subfolder === "output";
+  };
+  const outputImages = images.filter(isOutputImage);
+  const baseImages = outputImages.length > 0 ? outputImages : images;
+  const extraImages =
+    includeNonOutputNodeIds && includeNonOutputNodeIds.size > 0
+      ? images.filter((image) => image.nodeId && includeNonOutputNodeIds.has(image.nodeId))
+      : [];
+  const selectedImages = extraImages.length > 0 ? [...baseImages, ...extraImages] : baseImages;
+
+  const grouped = new Map<string, ComfyOutputImage[]>();
+  for (const image of selectedImages) {
+    const key = image.filename;
+    const group = grouped.get(key);
+    if (group) {
+      group.push(image);
+    } else {
+      grouped.set(key, [image]);
     }
   }
 
-  return Array.from(unique.values());
+  const selected: ComfyOutputImage[] = [];
+  for (const group of grouped.values()) {
+    const output = group.find((item) => (item.type || "").toLowerCase() === "output");
+    selected.push(output ?? group[0]);
+  }
+
+  return selected;
 };
 
 const resolveHistoryStatus = (historyEntry: Record<string, unknown> | null, outputs: ComfyOutputImage[]) => {
@@ -972,8 +1369,15 @@ const normalizeStringArray = (value?: unknown) => {
     .filter((item) => item.length > 0);
 };
 
+const normalizeOptionalFileName = (value?: string | null) => {
+  if (value === undefined || value === null) return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+};
+
 const loraCreateSchema = z.object({
   name: z.string().trim().min(1),
+  fileName: z.string().trim().nullable().optional(),
   triggerWords: z.array(z.string().trim()).optional(),
   recommendedWeightMin: z.number().finite().nullable().optional(),
   recommendedWeightMax: z.number().finite().nullable().optional(),
@@ -985,6 +1389,7 @@ const loraCreateSchema = z.object({
 const loraUpdateSchema = loraCreateSchema.partial().refine(
   (data) =>
     data.name !== undefined ||
+    data.fileName !== undefined ||
     data.triggerWords !== undefined ||
     data.recommendedWeightMin !== undefined ||
     data.recommendedWeightMax !== undefined ||
@@ -1113,6 +1518,8 @@ const comfyRunCreateSchema = z
       });
     }
   });
+
+type ComfyRunCreateInput = z.infer<typeof comfyRunCreateSchema>;
 
 const ideasZodSchema = (count: number) =>
   z.object({
@@ -1469,9 +1876,7 @@ app.post(
 
     const safeExt = resolveImageExtension(file);
     const inputFile = `tagger_${randomUUID()}_${Date.now()}${safeExt}`;
-    const inputName = path.posix.join("tagger_inputs", inputFile);
-    await fs.promises.mkdir(COMFY_TAGGER_INPUTS_DIR, { recursive: true });
-    await fs.promises.writeFile(path.join(COMFY_TAGGER_INPUTS_DIR, inputFile), file.buffer);
+    const inputName = await writeComfyInputFile("tagger_inputs", inputFile, file.buffer);
 
     let workflow: Record<string, any>;
     try {
@@ -1628,158 +2033,28 @@ app.post(
       return respondError(res, 400, "Invalid request", parsed.error.flatten());
     }
 
-    const runId = randomUUID();
-    let controlnetImageName: string | null = null;
-    let initImageName: string | null = null;
-
-    if (initImageFile || (controlnetFile && parsed.data.controlnetEnabled)) {
-      if (initImageFile) {
-        const safeExt = resolveImageExtension(initImageFile);
-        const initFile = `init_${runId}_${Date.now()}${safeExt}`;
-        initImageName = path.posix.join("init_images", initFile);
-        await fs.promises.mkdir(COMFY_INIT_IMAGES_DIR, { recursive: true });
-        await fs.promises.writeFile(path.join(COMFY_INIT_IMAGES_DIR, initFile), initImageFile.buffer);
-      }
-      if (controlnetFile && parsed.data.controlnetEnabled) {
-        const safeExt = resolveImageExtension(controlnetFile);
-        const controlFile = `controlnet_${runId}_${Date.now()}${safeExt}`;
-        controlnetImageName = path.posix.join("control_images", controlFile);
-        await fs.promises.mkdir(COMFY_CONTROL_IMAGES_DIR, { recursive: true });
-        await fs.promises.writeFile(path.join(COMFY_CONTROL_IMAGES_DIR, controlFile), controlnetFile.buffer);
-      }
+    const created = await createComfyRun(parsed.data, { initImageFile, controlnetFile });
+    if (!created.ok) {
+      return respondError(res, created.error.status, created.error.message, created.error.details);
     }
 
-    let workflow: Record<string, any>;
-    let resolvedSeed: number | null = null;
-    const ksamplerForWorkflow = parsed.data.ksampler ? { ...parsed.data.ksampler } : undefined;
-    if (ksamplerForWorkflow?.seed !== undefined && ksamplerForWorkflow.seed === -1) {
-      resolvedSeed = randomInt(0, 2147483648);
-      ksamplerForWorkflow.seed = resolvedSeed;
-    }
-    const templatePath = useImage2i ? COMFY_WORKFLOW_IMAGE2I_PATH : COMFY_WORKFLOW_TEXT2I_PATH;
-    try {
-      workflow = await readWorkflowTemplate(templatePath);
-      applyWorkflowOverrides(workflow, {
-        ...parsed.data,
-        mode: useImage2i ? "image2i" : "text2i",
-        ksampler: ksamplerForWorkflow,
-        loras: parsed.data.loras.map((item) => ({
-          name: item.name,
-          weight: item.weight ?? 1,
-          enabled: item.enabled ?? true
-        })),
-        controlnetImageName,
-        initImageName
-      });
-    } catch (err) {
-      return respondError(res, 500, "Failed to prepare workflow", {
-        error: err instanceof Error ? err.message : String(err)
-      });
-    }
-
-    const requestPayload = {
-      workflowId: parsed.data.workflowId,
-      positive: parsed.data.positive,
-      negative: parsed.data.negative,
-      ckptName: parsed.data.ckptName,
-      width: parsed.data.width,
-      height: parsed.data.height,
-      loras: parsed.data.loras,
-      controlnetEnabled: parsed.data.controlnetEnabled,
-      controlnetModel: parsed.data.controlnetModel ?? null,
-      preprocessorEnabled: parsed.data.preprocessorEnabled,
-      preprocessor: parsed.data.preprocessor ?? null,
-      controlnetStrength: parsed.data.controlnetStrength ?? null,
-      ksampler: parsed.data.ksampler ?? null,
-      ...(resolvedSeed !== null ? { ksamplerResolved: { seed: resolvedSeed } } : {}),
-      controlnetImage: controlnetImageName,
-      ...(initImageName ? { initImage: initImageName } : {})
-    };
-
-    await pool.query(
-      `INSERT INTO comfy_runs (id, status, prompt_id, request_json, workflow_json, history_json, error_message)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING *`,
-      [runId, "created", null, requestPayload, workflow, null, null]
-    );
-
-    const promptResult = await fetchComfyJson(
-      "/prompt",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: workflow })
-      },
-      COMFY_REQUEST_TIMEOUT_MS
-    );
-
-    if (!promptResult.ok) {
-      const errorMessage = promptResult.error.message;
-      await pool.query(
-        `UPDATE comfy_runs
-         SET status = $1, error_message = $2, updated_at = NOW(), finished_at = NOW()
-         WHERE id = $3
-         RETURNING *`,
-        ["failed", errorMessage, runId]
-      );
-      const status = errorMessage === "timeout" ? 504 : 502;
-      return respondError(res, status, errorMessage, {
-        runId,
-        ...(promptResult.error.details ? { details: promptResult.error.details } : {})
-      });
-    }
-
-    if (promptResult.data && typeof promptResult.data === "object" && (promptResult.data as any).error) {
-      const errorValue = (promptResult.data as any).error;
-      const errorMessage =
-        errorValue && typeof errorValue === "object" && typeof errorValue.message === "string"
-          ? errorValue.message
-          : typeof errorValue === "string"
-            ? errorValue
-            : "prompt_error";
-      await pool.query(
-        `UPDATE comfy_runs
-         SET status = $1, error_message = $2, updated_at = NOW(), finished_at = NOW()
-         WHERE id = $3
-         RETURNING *`,
-        ["failed", errorMessage, runId]
-      );
-      return respondError(res, 502, errorMessage, { runId });
-    }
-
-    const promptId =
-      promptResult.data && typeof promptResult.data === "object" && (promptResult.data as any).prompt_id
-        ? String((promptResult.data as any).prompt_id)
-        : "";
-
-    if (!promptId) {
-      await pool.query(
-        `UPDATE comfy_runs
-         SET status = $1, error_message = $2, updated_at = NOW(), finished_at = NOW()
-         WHERE id = $3
-         RETURNING *`,
-        ["failed", "prompt_id_missing", runId]
-      );
-      return respondError(res, 502, "prompt_id_missing", { runId });
-    }
-
-    const updated = await pool.query(
-      `UPDATE comfy_runs
-       SET status = $1, prompt_id = $2, updated_at = NOW(), started_at = NOW()
-       WHERE id = $3
-       RETURNING *`,
-      ["queued", promptId, runId]
-    );
-
-    res.status(201).json({ ok: true, data: { run: updated.rows[0] } });
+    res.status(201).json({ ok: true, data: { run: created.run } });
   })
 );
 
 app.get(
   "/api/comfy/runs",
-  asyncHandler(async (_req, res) => {
+  asyncHandler(async (req, res) => {
     res.set("Cache-Control", "no-store");
-    const result = await pool.query("SELECT * FROM comfy_runs ORDER BY updated_at DESC");
+    const parsed = comfyRunsListSchema.safeParse(req.query);
+    if (!parsed.success) {
+      return respondError(res, 400, "Invalid request", parsed.error.flatten());
+    }
+
+    const recipeId = parsed.data.recipeId;
+    const result = recipeId
+      ? await pool.query("SELECT * FROM comfy_runs WHERE recipe_id = $1 ORDER BY updated_at DESC", [recipeId])
+      : await pool.query("SELECT * FROM comfy_runs ORDER BY updated_at DESC");
     res.json({ ok: true, data: { runs: result.rows } });
   })
 );
@@ -1875,7 +2150,27 @@ app.post(
     }
 
       const historyEntry = resolveHistoryEntry(historyResult.data, run.prompt_id);
-      const outputs = extractHistoryOutputs(historyEntry);
+      const outputNodeInfo = resolveWorkflowOutputNodeInfo(run.workflow_json);
+      const controlnetEnabled =
+        run.request_json && typeof run.request_json === "object"
+          ? Boolean((run.request_json as any).controlnetEnabled)
+          : false;
+      const preprocessorOutputNodeIds = outputNodeInfo?.preprocessorOutputNodeIds ?? null;
+      const preprocessorPreviewNodeIds = outputNodeInfo?.preprocessorPreviewNodeIds ?? null;
+      const excludeNodeIds =
+        !controlnetEnabled && (preprocessorOutputNodeIds || preprocessorPreviewNodeIds)
+          ? new Set([
+              ...(preprocessorOutputNodeIds ? Array.from(preprocessorOutputNodeIds) : []),
+              ...(preprocessorPreviewNodeIds ? Array.from(preprocessorPreviewNodeIds) : [])
+            ])
+          : null;
+      const includeNonOutputNodeIds = controlnetEnabled ? preprocessorPreviewNodeIds : null;
+      const outputs = extractHistoryOutputs(
+        historyEntry,
+        outputNodeInfo?.outputNodeIds ?? null,
+        excludeNodeIds,
+        includeNonOutputNodeIds
+      );
       const historyStatus = resolveHistoryStatus(historyEntry, outputs);
       const startedAtValue = run.started_at ?? run.created_at;
       const startedAtMs =
@@ -2886,11 +3181,124 @@ const recipeLoraSelectQuery = `
   WHERE rl.recipe_id = $1
 `;
 
+type RecipeRunConfig = {
+  input: ComfyRunCreateInput;
+  initImageName: string | null;
+  controlnetImageName: string | null;
+  recipeSnapshot: Record<string, unknown>;
+};
+
+const buildRecipeRunConfig = async (recipe: any, recipeLoras: any[]): Promise<RecipeRunConfig> => {
+  const defaults = await getComfyTemplateDefaults();
+  const promptBlocks = asRecord(recipe?.prompt_blocks) ?? {};
+  const variables = getRecipeComfyConfig(recipe?.variables);
+  const controlnetConfig = asRecord(variables.controlnet) ?? {};
+  const i2iConfig = asRecord(variables.i2i) ?? asRecord(variables.image2i) ?? {};
+  const advancedConfig = asRecord(variables.advanced) ?? {};
+  const ksamplerConfig = asRecord(variables.ksampler) ?? asRecord(advancedConfig.ksampler) ?? advancedConfig;
+
+  const positive = readOptionalString(promptBlocks.positive) ?? defaults.efficientLoaderDefaults.positive ?? "";
+  const negative = readOptionalString(promptBlocks.negative) ?? defaults.efficientLoaderDefaults.negative ?? "";
+  const ckptName = defaults.efficientLoaderDefaults.ckptName ?? "";
+  const width = Math.trunc(defaults.efficientLoaderDefaults.width ?? 0);
+  const height = Math.trunc(defaults.efficientLoaderDefaults.height ?? 0);
+
+  const initImageName =
+    readOptionalString(i2iConfig.initImage ?? i2iConfig.image ?? variables.initImage ?? variables.init_image) ?? null;
+  const modeHint = readOptionalString(variables.mode);
+  const workflowHint = readOptionalString(variables.workflowId ?? variables.workflow_id ?? variables.workflow);
+  const i2iEnabled = readOptionalBoolean(
+    i2iConfig.enabled ?? variables.i2iEnabled ?? variables.image2iEnabled ?? variables.useImage2i
+  );
+  const useImage2i =
+    workflowHint === "base_image2i" || modeHint === "image2i" || modeHint === "i2i" || Boolean(i2iEnabled) || Boolean(initImageName);
+  const workflowId = useImage2i ? "base_image2i" : "base_text2i";
+
+  const controlnetEnabledRaw = readOptionalBoolean(
+    controlnetConfig.enabled ?? variables.controlnetEnabled ?? variables.controlnet_enabled
+  );
+  const controlnetEnabled = controlnetEnabledRaw ?? defaults.controlnetDefaults.enabled;
+  const controlnetModel =
+    readOptionalString(
+      controlnetConfig.model ?? controlnetConfig.modelName ?? variables.controlnetModel ?? variables.controlnet_model
+    ) ?? defaults.controlnetDefaults.modelName;
+  const preprocessorEnabled =
+    readOptionalBoolean(
+      controlnetConfig.preprocessorEnabled ?? variables.preprocessorEnabled ?? variables.preprocessor_enabled
+    ) ?? false;
+  const preprocessor =
+    readOptionalString(controlnetConfig.preprocessor ?? variables.preprocessor) ?? defaults.controlnetDefaults.preprocessor;
+  const controlnetStrength =
+    readOptionalNumber(controlnetConfig.strength ?? variables.controlnetStrength ?? variables.controlnet_strength) ??
+    defaults.controlnetDefaults.strength;
+  const controlnetImageName =
+    readOptionalString(
+      controlnetConfig.image ?? controlnetConfig.imageName ?? variables.controlnetImage ?? variables.controlnet_image
+    ) ?? readOptionalString(defaults.controlnetDefaults.imageName ?? undefined) ?? null;
+
+  const loras = recipeLoras
+    .map((link: any) => {
+      const name = readOptionalString(link.lora_name ?? link.name);
+      if (!name) return null;
+      const weight = Number.isFinite(Number(link.weight)) ? Number(link.weight) : 1;
+      return { name, weight, enabled: true };
+    })
+    .filter((item: any) => item !== null);
+
+  const loraInputs =
+    loras.length > 0
+      ? (loras as { name: string; weight: number; enabled: boolean }[])
+      : defaults.loraDefaults.map((item) => ({ name: item.name, weight: item.weight, enabled: true }));
+
+  const ksampler: Record<string, unknown> = {};
+  const stepsValue = readOptionalNumber(ksamplerConfig.steps);
+  if (stepsValue !== undefined) ksampler.steps = Math.trunc(stepsValue);
+  const cfgValue = readOptionalNumber(ksamplerConfig.cfg);
+  if (cfgValue !== undefined) ksampler.cfg = cfgValue;
+  const samplerName = readOptionalString(ksamplerConfig.sampler_name ?? ksamplerConfig.sampler);
+  if (samplerName) ksampler.sampler_name = samplerName;
+  const schedulerValue = readOptionalString(ksamplerConfig.scheduler);
+  if (schedulerValue) ksampler.scheduler = schedulerValue;
+  const seedValue = readOptionalNumber(ksamplerConfig.seed);
+  if (seedValue !== undefined) ksampler.seed = Math.trunc(seedValue);
+  const denoiseValue = readOptionalNumber(ksamplerConfig.denoise);
+  if (denoiseValue !== undefined) ksampler.denoise = denoiseValue;
+  const ksamplerPayload = Object.keys(ksampler).length > 0 ? (ksampler as ComfyRunCreateInput["ksampler"]) : undefined;
+
+  const input: ComfyRunCreateInput = {
+    workflowId,
+    positive,
+    negative,
+    ckptName,
+    width,
+    height,
+    loras: loraInputs,
+    controlnetEnabled,
+    controlnetModel,
+    preprocessorEnabled,
+    preprocessor,
+    controlnetStrength,
+    ksampler: ksamplerPayload
+  };
+
+  return {
+    input,
+    initImageName,
+    controlnetImageName,
+    recipeSnapshot: { recipe, loras: recipeLoras }
+  };
+};
+
+const mapLoraRow = (row: Record<string, any>) => ({
+  ...row,
+  fileName: row.file_name ?? null
+});
+
 app.get(
   "/api/loras",
   asyncHandler(async (_req, res) => {
     const result = await pool.query("SELECT * FROM loras ORDER BY created_at DESC");
-    res.json({ ok: true, data: { loras: result.rows } });
+    res.json({ ok: true, data: { loras: result.rows.map(mapLoraRow) } });
   })
 );
 
@@ -2903,18 +3311,20 @@ app.post(
     }
 
     const data = parsed.data;
+    const fileName = normalizeOptionalFileName(data.fileName);
     const triggerWords = normalizeStringArray(data.triggerWords);
     const tags = normalizeStringArray(data.tags);
     const examplePrompts = normalizeStringArray(data.examplePrompts);
 
     const result = await pool.query(
       `
-      INSERT INTO loras (name, trigger_words, recommended_weight_min, recommended_weight_max, notes, tags, example_prompts, created_at, updated_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+      INSERT INTO loras (name, file_name, trigger_words, recommended_weight_min, recommended_weight_max, notes, tags, example_prompts, created_at, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
       RETURNING *
     `,
       [
         data.name,
+        fileName,
         triggerWords,
         data.recommendedWeightMin ?? null,
         data.recommendedWeightMax ?? null,
@@ -2924,7 +3334,7 @@ app.post(
       ]
     );
 
-    res.status(201).json({ ok: true, data: { lora: result.rows[0] } });
+    res.status(201).json({ ok: true, data: { lora: mapLoraRow(result.rows[0]) } });
   })
 );
 
@@ -2939,7 +3349,7 @@ app.get(
     if (result.rowCount === 0) {
       return respondError(res, 404, "LoRA not found");
     }
-    res.json({ ok: true, data: { lora: result.rows[0] } });
+    res.json({ ok: true, data: { lora: mapLoraRow(result.rows[0]) } });
   })
 );
 
@@ -2961,6 +3371,10 @@ app.patch(
     if (parsed.data.name !== undefined) {
       updates.push(`name = $${idx++}`);
       values.push(parsed.data.name);
+    }
+    if (parsed.data.fileName !== undefined) {
+      updates.push(`file_name = $${idx++}`);
+      values.push(normalizeOptionalFileName(parsed.data.fileName));
     }
     if (parsed.data.triggerWords !== undefined) {
       updates.push(`trigger_words = $${idx++}`);
@@ -2993,7 +3407,7 @@ app.patch(
     if (result.rowCount === 0) {
       return respondError(res, 404, "LoRA not found");
     }
-    res.json({ ok: true, data: { lora: result.rows[0] } });
+    res.json({ ok: true, data: { lora: mapLoraRow(result.rows[0]) } });
   })
 );
 
@@ -3038,7 +3452,10 @@ app.post(
       loraId.data
     ]);
 
-    res.json({ ok: true, data: { thumbnailKey: key, url: `/media/${encodeMediaKey(key)}`, lora: updated.rows[0] } });
+    res.json({
+      ok: true,
+      data: { thumbnailKey: key, url: `/media/${encodeMediaKey(key)}`, lora: mapLoraRow(updated.rows[0]) }
+    });
   })
 );
 
@@ -3140,6 +3557,51 @@ app.get(
     }
     const loraResult = await pool.query(`${recipeLoraSelectQuery} ORDER BY rl.sort_order ASC, l.name ASC`, [recipeId.data]);
     res.json({ ok: true, data: { recipe: recipeResult.rows[0], loras: loraResult.rows } });
+  })
+);
+
+app.post(
+  "/api/workshop/recipes/:id/run",
+  asyncHandler(async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    const recipeId = z.string().uuid().safeParse(req.params.id);
+    if (!recipeId.success) {
+      return respondError(res, 400, "Invalid recipe id");
+    }
+    const recipeResult = await pool.query("SELECT * FROM recipes WHERE id = $1", [recipeId.data]);
+    if (recipeResult.rowCount === 0) {
+      return respondError(res, 404, "Recipe not found");
+    }
+
+    const loraResult = await pool.query(`${recipeLoraSelectQuery} ORDER BY rl.sort_order ASC, l.name ASC`, [recipeId.data]);
+    let config: RecipeRunConfig;
+    try {
+      config = await buildRecipeRunConfig(recipeResult.rows[0], loraResult.rows);
+    } catch (err) {
+      return respondError(res, 500, "Failed to build recipe run", {
+        error: err instanceof Error ? err.message : String(err)
+      });
+    }
+
+    const parsed = comfyRunCreateSchema.safeParse(config.input);
+    if (!parsed.success) {
+      return respondError(res, 400, "Invalid recipe run configuration", parsed.error.flatten());
+    }
+    if (parsed.data.workflowId === "base_image2i" && !config.initImageName) {
+      return respondError(res, 400, "initImage is required for image2i");
+    }
+
+    const created = await createComfyRun(parsed.data, {
+      initImageName: config.initImageName,
+      controlnetImageName: config.controlnetImageName,
+      recipeId: recipeId.data,
+      recipeSnapshot: config.recipeSnapshot
+    });
+    if (!created.ok) {
+      return respondError(res, created.error.status, created.error.message, created.error.details);
+    }
+
+    res.status(201).json({ ok: true, data: { run: created.run } });
   })
 );
 
@@ -3383,6 +3845,17 @@ const galleryListSchema = z.object({
   dateTo: z.string().trim().min(1).optional(),
   q: z.string().trim().min(1).optional(),
   favorited: z.union([z.string(), z.boolean()]).optional()
+});
+
+const comfyRunsListSchema = z.object({
+  recipeId: z.preprocess(
+    (value) => {
+      if (Array.isArray(value)) return value[0];
+      if (typeof value === "string" && value.trim() === "") return undefined;
+      return value;
+    },
+    z.string().uuid().optional()
+  )
 });
 
 const galleryFavoriteSchema = z.object({

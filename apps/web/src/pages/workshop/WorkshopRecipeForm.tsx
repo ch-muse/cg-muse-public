@@ -1,8 +1,8 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useLocation } from "react-router-dom";
 import { api, ApiClientError, API_BASE_URL } from "../../lib/api.js";
 import PromptComposer from "../../components/prompt/PromptComposer.js";
-import type { Lora, Recipe, RecipeLoraLink, RecipeTarget } from "../../types.js";
+import type { GalleryItem, Lora, Recipe, RecipeLoraLink, RecipeTarget } from "../../types.js";
 
 const targetOptions: RecipeTarget[] = ["SDXL", "COMFYUI_BLOCKS"];
 const normalize = (value: string) => value.trim().toLowerCase();
@@ -27,6 +27,21 @@ const safeJsonStringify = (value: unknown) => {
     return "{}";
   }
 };
+
+type RecipeRun = {
+  id: string;
+  status?: string | null;
+  prompt_id?: string | null;
+  request_json?: unknown;
+  created_at?: string | null;
+  updated_at?: string | null;
+};
+
+const RUN_SUBMIT_TIMEOUT_MS = 12_000;
+const RUNS_FETCH_TIMEOUT_MS = 8_000;
+const RUNS_POLL_INTERVAL_MS = 2_500;
+const GALLERY_FETCH_TIMEOUT_MS = 8_000;
+const GALLERY_FETCH_LIMIT = 36;
 
 export default function WorkshopRecipeForm() {
   const { id } = useParams<{ id: string }>();
@@ -58,6 +73,29 @@ export default function WorkshopRecipeForm() {
   const [taggerLoading, setTaggerLoading] = useState(false);
   const [taggerError, setTaggerError] = useState<string | null>(null);
   const [taggerMessage, setTaggerMessage] = useState<string | null>(null);
+  const [runSubmitting, setRunSubmitting] = useState(false);
+  const [runError, setRunError] = useState<string | null>(null);
+  const [runMessage, setRunMessage] = useState<string | null>(null);
+  const [recipeRuns, setRecipeRuns] = useState<RecipeRun[]>([]);
+  const [runsPhase, setRunsPhase] = useState<"idle" | "fetching" | "success" | "error">("idle");
+  const [runsError, setRunsError] = useState<string | null>(null);
+  const [galleryItems, setGalleryItems] = useState<GalleryItem[]>([]);
+  const [galleryPhase, setGalleryPhase] = useState<"idle" | "fetching" | "success" | "error">("idle");
+  const [galleryError, setGalleryError] = useState<string | null>(null);
+
+  const activeRef = useRef(true);
+  const runSubmitInFlightRef = useRef(false);
+  const runSubmitRequestIdRef = useRef(0);
+  const runSubmitAbortRef = useRef<AbortController | null>(null);
+  const runsInFlightRef = useRef(false);
+  const runsRequestIdRef = useRef(0);
+  const runsAbortRef = useRef<AbortController | null>(null);
+  const runsPollTimeoutRef = useRef<number | null>(null);
+  const runsRef = useRef<RecipeRun[]>([]);
+  const runsActiveRef = useRef(false);
+  const galleryInFlightRef = useRef(false);
+  const galleryRequestIdRef = useRef(0);
+  const galleryAbortRef = useRef<AbortController | null>(null);
 
   const [linkForm, setLinkForm] = useState({
     loraId: "",
@@ -65,6 +103,20 @@ export default function WorkshopRecipeForm() {
     usageNotes: "",
     sortOrder: "0"
   });
+
+  useEffect(() => {
+    activeRef.current = true;
+    return () => {
+      activeRef.current = false;
+      runSubmitAbortRef.current?.abort();
+      runsAbortRef.current?.abort();
+      galleryAbortRef.current?.abort();
+      if (runsPollTimeoutRef.current) {
+        window.clearTimeout(runsPollTimeoutRef.current);
+        runsPollTimeoutRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -292,6 +344,253 @@ export default function WorkshopRecipeForm() {
     }
   };
 
+  const fetchRecipeGallery = useCallback(
+    async (options?: { silent?: boolean }) => {
+      if (!id) return;
+      if (galleryInFlightRef.current) return;
+      galleryInFlightRef.current = true;
+      const requestId = galleryRequestIdRef.current + 1;
+      galleryRequestIdRef.current = requestId;
+      galleryAbortRef.current?.abort();
+      const controller = new AbortController();
+      galleryAbortRef.current = controller;
+      const timeoutId = window.setTimeout(() => controller.abort(), GALLERY_FETCH_TIMEOUT_MS);
+
+      if (!options?.silent) {
+        setGalleryPhase("fetching");
+        setGalleryError(null);
+      }
+
+      let rawText = "";
+      try {
+        const url = `${API_BASE_URL}/api/gallery/items?limit=${GALLERY_FETCH_LIMIT}`;
+        const response = await fetch(url, { signal: controller.signal, cache: "no-store" });
+        rawText = await response.text();
+
+        if (!activeRef.current || requestId !== galleryRequestIdRef.current) {
+          return;
+        }
+
+        let json: any = null;
+        if (rawText.trim()) {
+          try {
+            json = JSON.parse(rawText);
+          } catch (err) {
+            setGalleryPhase("error");
+            setGalleryError(`Invalid JSON: ${err instanceof Error ? err.message : String(err)}`);
+            return;
+          }
+        }
+
+        if (!response.ok) {
+          setGalleryPhase("error");
+          setGalleryError(json?.error?.message || `HTTP ${response.status}`);
+          return;
+        }
+
+        if (!json || json.ok !== true) {
+          setGalleryPhase("error");
+          setGalleryError(json?.error?.message || "Gallery request failed");
+          return;
+        }
+
+        const list = Array.isArray(json?.data?.items) ? (json.data.items as GalleryItem[]) : [];
+        const filtered = list.filter((item) => item.recipe_id === id);
+        setGalleryItems(filtered);
+        setGalleryPhase("success");
+        setGalleryError(null);
+      } catch (err) {
+        if (!activeRef.current || requestId !== galleryRequestIdRef.current) {
+          return;
+        }
+        const isTimeout = err instanceof Error && err.name === "AbortError";
+        setGalleryPhase("error");
+        setGalleryError(isTimeout ? "gallery timeout" : err instanceof Error ? err.message : String(err));
+      } finally {
+        clearTimeout(timeoutId);
+        if (galleryRequestIdRef.current === requestId) {
+          galleryInFlightRef.current = false;
+        }
+      }
+    },
+    [id]
+  );
+
+  const fetchRecipeRuns = useCallback(
+    async (options?: { silent?: boolean }) => {
+      if (!id) return;
+      if (runsInFlightRef.current) return;
+      runsInFlightRef.current = true;
+      const requestId = runsRequestIdRef.current + 1;
+      runsRequestIdRef.current = requestId;
+      runsAbortRef.current?.abort();
+      const controller = new AbortController();
+      runsAbortRef.current = controller;
+      const timeoutId = window.setTimeout(() => controller.abort(), RUNS_FETCH_TIMEOUT_MS);
+
+      if (!options?.silent) {
+        setRunsPhase("fetching");
+        setRunsError(null);
+      }
+
+      let rawText = "";
+      let list: RecipeRun[] = [];
+      try {
+        const url = `${API_BASE_URL}/api/comfy/runs?recipeId=${encodeURIComponent(id)}`;
+        const response = await fetch(url, { signal: controller.signal, cache: "no-store" });
+        rawText = await response.text();
+
+        if (!activeRef.current || requestId !== runsRequestIdRef.current) {
+          return;
+        }
+
+        let json: any = null;
+        if (rawText.trim()) {
+          try {
+            json = JSON.parse(rawText);
+          } catch (err) {
+            setRunsPhase("error");
+            setRunsError(`Invalid JSON: ${err instanceof Error ? err.message : String(err)}`);
+            return;
+          }
+        }
+
+        if (!response.ok) {
+          setRunsPhase("error");
+          setRunsError(json?.error?.message || `HTTP ${response.status}`);
+          return;
+        }
+
+        if (!json || json.ok !== true) {
+          setRunsPhase("error");
+          setRunsError(json?.error?.message || "Runs request failed");
+          return;
+        }
+
+        list = Array.isArray(json?.data?.runs) ? (json.data.runs as RecipeRun[]) : [];
+        setRecipeRuns(list);
+        runsRef.current = list;
+        setRunsPhase("success");
+        setRunsError(null);
+      } catch (err) {
+        if (!activeRef.current || requestId !== runsRequestIdRef.current) {
+          return;
+        }
+        const isTimeout = err instanceof Error && err.name === "AbortError";
+        setRunsPhase("error");
+        setRunsError(isTimeout ? "runs timeout" : err instanceof Error ? err.message : String(err));
+      } finally {
+        clearTimeout(timeoutId);
+        if (runsRequestIdRef.current === requestId) {
+          runsInFlightRef.current = false;
+        }
+      }
+
+      if (!activeRef.current || requestId !== runsRequestIdRef.current) {
+        return;
+      }
+
+      const hasActive = list.length > 0 ? list.some((run) => isRunActive(run.status)) : runsRef.current.some((run) => isRunActive(run.status));
+      const wasActive = runsActiveRef.current;
+      runsActiveRef.current = hasActive;
+
+      if (wasActive && !hasActive) {
+        void fetchRecipeGallery({ silent: true });
+      }
+
+      if (hasActive && !runsPollTimeoutRef.current) {
+        runsPollTimeoutRef.current = window.setTimeout(() => {
+          runsPollTimeoutRef.current = null;
+          void fetchRecipeRuns({ silent: true });
+        }, RUNS_POLL_INTERVAL_MS);
+      }
+    },
+    [fetchRecipeGallery, id]
+  );
+
+  const handleRunRecipe = useCallback(async () => {
+    if (!id) return;
+    if (runSubmitInFlightRef.current) return;
+    runSubmitInFlightRef.current = true;
+    setRunSubmitting(true);
+    setRunError(null);
+    setRunMessage(null);
+
+    const requestId = runSubmitRequestIdRef.current + 1;
+    runSubmitRequestIdRef.current = requestId;
+    runSubmitAbortRef.current?.abort();
+    const controller = new AbortController();
+    runSubmitAbortRef.current = controller;
+    const timeoutId = window.setTimeout(() => controller.abort(), RUN_SUBMIT_TIMEOUT_MS);
+
+    try {
+      const url = `${API_BASE_URL}/api/workshop/recipes/${encodeURIComponent(id)}/run`;
+      const response = await fetch(url, { method: "POST", signal: controller.signal, cache: "no-store" });
+      const rawText = await response.text();
+
+      if (!activeRef.current || requestId !== runSubmitRequestIdRef.current) {
+        return;
+      }
+
+      let json: any = null;
+      if (rawText.trim()) {
+        try {
+          json = JSON.parse(rawText);
+        } catch (err) {
+          setRunError(`Invalid JSON: ${err instanceof Error ? err.message : String(err)}`);
+          return;
+        }
+      }
+
+      if (!response.ok) {
+        setRunError(json?.error?.message || `HTTP ${response.status}`);
+        return;
+      }
+
+      if (!json || json.ok !== true) {
+        setRunError(json?.error?.message || "Run request failed");
+        return;
+      }
+
+      const run = json?.data?.run as RecipeRun | undefined;
+      setRunMessage(run?.id ? `Runを作成しました: ${run.id}` : "Runを作成しました。");
+      void fetchRecipeRuns();
+      void fetchRecipeGallery({ silent: true });
+    } catch (err) {
+      if (!activeRef.current || requestId !== runSubmitRequestIdRef.current) {
+        return;
+      }
+      const isTimeout = err instanceof Error && err.name === "AbortError";
+      setRunError(isTimeout ? "run timeout" : err instanceof Error ? err.message : String(err));
+    } finally {
+      clearTimeout(timeoutId);
+      if (runSubmitRequestIdRef.current === requestId) {
+        runSubmitInFlightRef.current = false;
+        setRunSubmitting(false);
+      }
+    }
+  }, [fetchRecipeGallery, fetchRecipeRuns, id]);
+
+  useEffect(() => {
+    if (!id || isNew) return;
+    runsRef.current = [];
+    runsActiveRef.current = false;
+    if (runsPollTimeoutRef.current) {
+      window.clearTimeout(runsPollTimeoutRef.current);
+      runsPollTimeoutRef.current = null;
+    }
+    void fetchRecipeRuns();
+    void fetchRecipeGallery();
+    return () => {
+      runsAbortRef.current?.abort();
+      galleryAbortRef.current?.abort();
+      if (runsPollTimeoutRef.current) {
+        window.clearTimeout(runsPollTimeoutRef.current);
+        runsPollTimeoutRef.current = null;
+      }
+    };
+  }, [fetchRecipeGallery, fetchRecipeRuns, id, isNew]);
+
   const handleLinkLora = async (event: FormEvent) => {
     event.preventDefault();
     if (!id) return;
@@ -408,6 +707,26 @@ export default function WorkshopRecipeForm() {
         <div className="rounded-lg border border-emerald-500/30 bg-emerald-900/20 px-4 py-3 text-sm text-emerald-100">
           {success}
         </div>
+      )}
+      {!isNew && recipe && (
+        <section className="space-y-3 rounded-xl border border-slate-800 bg-slate-900/80 p-6 shadow-lg">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <h2 className="text-xl font-semibold text-white">Run</h2>
+              <p className="text-sm text-slate-400">Recipeをそのまま実行し、Run履歴を生成します。</p>
+            </div>
+            <button
+              type="button"
+              onClick={handleRunRecipe}
+              disabled={runSubmitting}
+              className="rounded-lg bg-emerald-400 px-6 py-3 text-base font-semibold text-slate-950 shadow hover:bg-emerald-300 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-300"
+            >
+              {runSubmitting ? "実行中..." : "Run Recipe"}
+            </button>
+          </div>
+          {runError && <div className="text-sm text-red-200">Error: {runError}</div>}
+          {runMessage && <div className="text-sm text-emerald-200">{runMessage}</div>}
+        </section>
       )}
       {!isNew ? (
         <section className="space-y-4 rounded-xl border border-slate-800 bg-slate-900/80 p-6 shadow-lg">
@@ -616,6 +935,112 @@ export default function WorkshopRecipeForm() {
           </>
         )}
       </form>
+
+      {!isNew && recipe && (
+        <section className="space-y-4 rounded-xl border border-slate-800 bg-slate-900/80 p-6 shadow-lg">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="text-xl font-semibold text-white">このRecipeの履歴（runs）</h2>
+              <p className="text-sm text-slate-400">実行状況は queued / running の間だけ自動更新します。</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => fetchRecipeRuns()}
+              className="rounded-md border border-emerald-400/60 px-3 py-2 text-xs font-semibold text-emerald-100 hover:bg-emerald-500/10 disabled:opacity-50"
+              disabled={runsPhase === "fetching"}
+            >
+              {runsPhase === "fetching" ? "更新中..." : "更新"}
+            </button>
+          </div>
+          {runsError && <div className="text-sm text-red-200">Error: {runsError}</div>}
+          {recipeRuns.length === 0 ? (
+            <p className="text-sm text-slate-400">まだ実行履歴がありません。</p>
+          ) : (
+            <div className="rounded-lg border border-slate-800 bg-slate-950/50">
+              <table className="w-full text-left text-sm">
+                <thead className="bg-slate-900/60 text-slate-300">
+                  <tr>
+                    <th className="px-3 py-2 font-semibold">Created</th>
+                    <th className="px-3 py-2 font-semibold">Status</th>
+                    <th className="px-3 py-2 font-semibold">CKPT / Size</th>
+                    <th className="px-3 py-2 font-semibold">Prompt ID</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800">
+                  {recipeRuns.map((run) => {
+                    const request = resolveRunRequest(run.request_json);
+                    const ckpt = resolveRunCkpt(request);
+                    const size = formatSize(resolveNumber(request.width), resolveNumber(request.height));
+                    return (
+                      <tr key={run.id} className="hover:bg-slate-800/40">
+                        <td className="px-3 py-2 text-slate-200">{formatDate(run.created_at || run.updated_at)}</td>
+                        <td className="px-3 py-2 text-slate-200">{formatRunStatus(run.status)}</td>
+                        <td className="px-3 py-2 text-slate-200">
+                          <div>{ckpt || "-"}</div>
+                          <div className="text-xs text-slate-400">{size}</div>
+                        </td>
+                        <td className="px-3 py-2 text-xs text-slate-300">{run.prompt_id || "-"}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      )}
+
+      {!isNew && recipe && (
+        <section className="space-y-4 rounded-xl border border-slate-800 bg-slate-900/80 p-6 shadow-lg">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="text-xl font-semibold text-white">結果（gallery）</h2>
+              <p className="text-sm text-slate-400">Recipeに紐づいた直近の生成結果を表示します。</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => fetchRecipeGallery()}
+              className="rounded-md border border-emerald-400/60 px-3 py-2 text-xs font-semibold text-emerald-100 hover:bg-emerald-500/10 disabled:opacity-50"
+              disabled={galleryPhase === "fetching"}
+            >
+              {galleryPhase === "fetching" ? "更新中..." : "更新"}
+            </button>
+          </div>
+          {galleryError && <div className="text-sm text-red-200">Error: {galleryError}</div>}
+          {galleryItems.length === 0 ? (
+            <p className="text-sm text-slate-400">該当するギャラリー結果がまだありません。</p>
+          ) : (
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              {galleryItems.map((item) => {
+                const viewUrl = resolveGalleryViewUrl(item);
+                return (
+                  <a
+                    key={item.id}
+                    href={viewUrl || "#"}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="group rounded-lg border border-slate-800 bg-slate-950/60 p-3 hover:border-emerald-400/40"
+                  >
+                    <div className="aspect-square w-full overflow-hidden rounded-md bg-slate-900">
+                      {viewUrl ? (
+                        <img
+                          src={viewUrl}
+                          alt={item.filename || "gallery"}
+                          className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+                          loading="lazy"
+                        />
+                      ) : (
+                        <div className="flex h-full w-full items-center justify-center text-xs text-slate-500">No image</div>
+                      )}
+                    </div>
+                    <div className="mt-2 text-xs text-slate-400">{formatDate(item.created_at)}</div>
+                  </a>
+                );
+              })}
+            </div>
+          )}
+        </section>
+      )}
 
       {!isNew && recipe && (
         <div className="grid gap-6 lg:grid-cols-2">
@@ -831,4 +1256,49 @@ function formatLoraLabel(lora: Lora) {
 function truncateList(items: string[], max: number) {
   if (items.length <= max) return items.join(", ");
   return `${items.slice(0, max).join(", ")} (+${items.length - max})`;
+}
+
+function resolveRunRequest(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return value as Record<string, unknown>;
+}
+
+function resolveNumber(value: unknown): number | null {
+  if (value === undefined || value === null || value === "") return null;
+  const num = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+
+function resolveRunCkpt(request: Record<string, unknown>): string | null {
+  const candidates = [request.ckptName, request.ckpt_name, request.checkpoint, request.checkpointName];
+  for (const value of candidates) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+function formatSize(width?: number | null, height?: number | null) {
+  if (width && height) return `${width}x${height}`;
+  return "-";
+}
+
+function formatRunStatus(status?: string | null) {
+  if (!status) return "-";
+  return status;
+}
+
+function isRunActive(status?: string | null) {
+  return status === "created" || status === "queued" || status === "running";
+}
+
+function formatDate(value?: string | null) {
+  if (!value) return "-";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return String(value);
+  return parsed.toLocaleString();
+}
+
+function resolveGalleryViewUrl(item: GalleryItem) {
+  if (!item.viewUrl) return null;
+  return `${API_BASE_URL}${item.viewUrl}`;
 }

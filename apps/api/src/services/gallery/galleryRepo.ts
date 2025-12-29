@@ -7,6 +7,7 @@ export type GalleryItemRow = {
   source_type: string;
   source_id: string | null;
   comfy_run_id: string | null;
+  recipe_id: string | null;
   rel_path: string | null;
   prompt_id: string | null;
   filename: string;

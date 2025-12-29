@@ -1,9 +1,10 @@
-import { Fragment, useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { useSearchParams } from "react-router-dom";
 import { API_BASE_URL } from "../lib/api.js";
-import PromptComposer from "../components/prompt/PromptComposer.js";
+import PromptComposer, { normalizeTokenKey } from "../components/prompt/PromptComposer.js";
 import TagDictionaryPanel from "../components/prompt/TagDictionaryPanel.js";
 import type { TagDictionary } from "../lib/tagDictionary.js";
+import type { Lora } from "../types.js";
 
 type ComfyOptionsData = {
   ckptNames: string[];
@@ -126,6 +127,7 @@ const RUNS_FETCH_TIMEOUT_MS = 8000;
 const RUNS_REFRESH_TIMEOUT_MS = 8000;
 const RUNS_DELETE_TIMEOUT_MS = 8000;
 const REHYDRATE_TIMEOUT_MS = 8000;
+const LORA_LIBRARY_TIMEOUT_MS = 8000;
 const LORA_RESULT_LIMIT = 80;
 
 const emptyOptions: ComfyOptionsData = {
@@ -147,6 +149,59 @@ const normalizeStringArray = (value: unknown) => {
     .filter((item) => typeof item === "string")
     .map((item) => item.trim())
     .filter((item) => item.length > 0);
+};
+
+const normalizeLoraFileKey = (value: string) => {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  const normalized = trimmed.replace(/\\/g, "/");
+  const base = normalized.split("/").pop() ?? normalized;
+  return base.trim().toLowerCase();
+};
+
+const splitPromptTokens = (value: string) =>
+  value
+    .split(",")
+    .map((token) => token.trim())
+    .filter((token) => token.length > 0);
+
+const splitTriggerTokens = (value: unknown) => {
+  const source = Array.isArray(value) ? value : typeof value === "string" ? [value] : [];
+  const tokens: string[] = [];
+  for (const item of source) {
+    if (typeof item !== "string") continue;
+    for (const part of item.split(",")) {
+      const trimmed = part.trim();
+      if (trimmed.length > 0) {
+        tokens.push(trimmed);
+      }
+    }
+  }
+  return tokens;
+};
+
+const buildLoraLibraryMap = (library: Lora[]) => {
+  const map = new Map<string, Lora>();
+  for (const entry of library) {
+    const fileName = typeof entry.fileName === "string" ? entry.fileName : "";
+    if (!fileName) continue;
+    const key = normalizeLoraFileKey(fileName);
+    if (!key || map.has(key)) continue;
+    map.set(key, entry);
+  }
+  return map;
+};
+
+const dedupeTokensByKey = (tokens: string[]) => {
+  const seen = new Set<string>();
+  const next: string[] = [];
+  for (const token of tokens) {
+    const key = normalizeTokenKey(token);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    next.push(token);
+  }
+  return next;
 };
 
 const filterLoraNames = (names: string[], query: string) => {
@@ -307,6 +362,7 @@ export default function PlayComfyRunnerPage() {
   const [positive, setPositive] = useState("");
   const [negative, setNegative] = useState("");
   const [tagDictionary, setTagDictionary] = useState<TagDictionary | null>(null);
+  const [loraLibrary, setLoraLibrary] = useState<Lora[]>([]);
   const [width, setWidth] = useState("1216");
   const [height, setHeight] = useState("1728");
   const [controlnetEnabled, setControlnetEnabled] = useState(false);
@@ -410,6 +466,9 @@ export default function PlayComfyRunnerPage() {
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const runsPollStartRef = useRef<number>(0);
   const activeRef = useRef(true);
+  const loraLibraryInFlightRef = useRef(false);
+  const loraLibraryRequestIdRef = useRef(0);
+  const loraLibraryAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     activeRef.current = true;
@@ -423,6 +482,9 @@ export default function PlayComfyRunnerPage() {
       }
       if (rehydrateGalleryInFlightRef.current) {
         rehydrateGalleryInFlightRef.current.abort();
+      }
+      if (loraLibraryAbortRef.current) {
+        loraLibraryAbortRef.current.abort();
       }
     };
   }, []);
@@ -569,6 +631,66 @@ export default function PlayComfyRunnerPage() {
   useEffect(() => {
     fetchOptions();
   }, [fetchOptions]);
+
+  const fetchLoraLibrary = useCallback(async (): Promise<Lora[] | null> => {
+    if (loraLibraryInFlightRef.current) return;
+    loraLibraryInFlightRef.current = true;
+    const requestId = loraLibraryRequestIdRef.current + 1;
+    loraLibraryRequestIdRef.current = requestId;
+
+    const controller = new AbortController();
+    loraLibraryAbortRef.current = controller;
+    const timeoutId = setTimeout(() => controller.abort(), LORA_LIBRARY_TIMEOUT_MS);
+    let rawText = "";
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/loras`, {
+        signal: controller.signal,
+        cache: "no-store"
+      });
+      rawText = await response.text();
+
+      if (!activeRef.current || requestId !== loraLibraryRequestIdRef.current) {
+        return;
+      }
+
+      if (!response.ok) {
+        return null;
+      }
+
+      let json: any = null;
+      if (rawText.trim()) {
+        try {
+          json = JSON.parse(rawText);
+        } catch {
+          return null;
+        }
+      }
+
+      if (!json || json.ok !== true) {
+        return null;
+      }
+
+      const nextLoras = Array.isArray(json.data?.loras) ? json.data.loras : [];
+      setLoraLibrary(nextLoras);
+      return nextLoras;
+    } catch {
+      if (!activeRef.current || requestId !== loraLibraryRequestIdRef.current) {
+        return;
+      }
+      return null;
+    } finally {
+      clearTimeout(timeoutId);
+      if (loraLibraryAbortRef.current === controller) {
+        loraLibraryAbortRef.current = null;
+      }
+      loraLibraryInFlightRef.current = false;
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchLoraLibrary();
+  }, [fetchLoraLibrary]);
 
   useEffect(() => {
     if (!rehydrateRunId) return;
@@ -778,6 +900,63 @@ export default function PlayComfyRunnerPage() {
   const ckptDisabled = isOptionDisabled(options.ckptNames);
   const loraDisabled = isOptionDisabled(options.loraNames);
   const isImage2i = Boolean(initImageFile);
+  const loraLibraryByFileName = useMemo(() => buildLoraLibraryMap(loraLibrary), [loraLibrary]);
+  const resolveLoraTriggerTokens = useCallback(
+    (loraName: string, mapOverride?: Map<string, Lora>) => {
+      const lookup = mapOverride ?? loraLibraryByFileName;
+      const key = normalizeLoraFileKey(loraName);
+      if (!key) return [];
+      const entry = lookup.get(key);
+      if (!entry) return [];
+      const raw = (entry as any).trigger_words ?? (entry as any).triggerWords;
+      return dedupeTokensByKey(splitTriggerTokens(raw));
+    },
+    [loraLibraryByFileName]
+  );
+  const positiveTokenKeys = useMemo(() => {
+    const keys = new Set<string>();
+    for (const token of splitPromptTokens(positive)) {
+      const normalized = normalizeTokenKey(token);
+      if (normalized) keys.add(normalized);
+    }
+    return keys;
+  }, [positive]);
+
+  const insertPositiveTokens = useCallback(
+    (incoming: string[]) => {
+      if (incoming.length === 0) return;
+      const existing = splitPromptTokens(positive);
+      const seen = new Set(existing.map((token) => normalizeTokenKey(token)).filter((key) => key.length > 0));
+      const next = [...existing];
+      for (const token of incoming) {
+        const trimmed = token.trim().replace(/\s+/g, " ");
+        const key = normalizeTokenKey(trimmed);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        next.push(trimmed);
+      }
+      if (next.length !== existing.length) {
+        setPositive(next.join(", "));
+      }
+    },
+    [positive, setPositive]
+  );
+
+  const handleInsertLoraTriggers = useCallback(
+    async (loraName: string) => {
+      if (!loraName.trim()) return;
+      let lookupMap = loraLibraryByFileName;
+      if (lookupMap.size === 0) {
+        const nextLibrary = await fetchLoraLibrary();
+        if (nextLibrary && nextLibrary.length > 0) {
+          lookupMap = buildLoraLibraryMap(nextLibrary);
+        }
+      }
+      const triggers = resolveLoraTriggerTokens(loraName, lookupMap);
+      insertPositiveTokens(triggers);
+    },
+    [fetchLoraLibrary, insertPositiveTokens, loraLibraryByFileName, resolveLoraTriggerTokens]
+  );
 
   const handleSwapSize = () => {
     setWidth(height);
@@ -1408,80 +1587,123 @@ export default function PlayComfyRunnerPage() {
             </button>
           </div>
             <div className="mt-4 space-y-3">
-              {loraRows.map((row) => (
-                <div key={row.id} className="grid gap-2 md:grid-cols-[1fr_120px_auto]">
-                  <div className="relative">
-                    <input
-                      type="text"
-                      placeholder="Search LoRA..."
-                      className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none disabled:opacity-60"
-                      disabled={loraDisabled}
-                      value={row.name}
-                      onFocus={() => setActiveLoraRowId(row.id)}
-                      onBlur={() => {
-                        setTimeout(() => {
-                          setActiveLoraRowId((current) => (current === row.id ? null : current));
-                        }, 120);
-                      }}
-                      onChange={(event) =>
-                        setLoraRows((rows) =>
-                          rows.map((item) => (item.id === row.id ? { ...item, name: event.target.value } : item))
-                        )
-                      }
-                    />
-                    {activeLoraRowId === row.id && !loraDisabled && (
-                      <div className="absolute z-20 mt-1 max-h-56 w-full overflow-auto rounded-md border border-slate-800 bg-slate-950 text-sm text-slate-200 shadow-lg">
-                        {filterLoraNames(options.loraNames, row.name).length === 0 ? (
-                          <div className="px-3 py-2 text-xs text-slate-500">No matches</div>
-                        ) : (
-                          filterLoraNames(options.loraNames, row.name).map((name) => (
-                            <button
-                              key={name}
-                              type="button"
-                              onMouseDown={(event) => event.preventDefault()}
-                              onClick={() => {
-                                setLoraRows((rows) =>
-                                  rows.map((item) => (item.id === row.id ? { ...item, name } : item))
-                                );
-                                setActiveLoraRowId(null);
-                              }}
-                              className="block w-full px-3 py-2 text-left text-xs text-slate-200 transition hover:bg-slate-800"
-                            >
-                              {name}
-                            </button>
-                          ))
-                        )}
-                        {options.loraNames.length > LORA_RESULT_LIMIT && (
-                          <div className="px-3 py-2 text-[11px] text-slate-500">
-                            Showing first {LORA_RESULT_LIMIT} results
+              {loraRows.map((row) => {
+                const hasLoraName = row.name.trim().length > 0;
+                const rowTriggers = hasLoraName ? resolveLoraTriggerTokens(row.name) : [];
+                return (
+                  <div key={row.id} className="space-y-2">
+                    <div className="grid gap-2 md:grid-cols-[1fr_120px_auto]">
+                      <div className="relative">
+                        <input
+                          type="text"
+                          placeholder="Search LoRA..."
+                          className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none disabled:opacity-60"
+                          disabled={loraDisabled}
+                          value={row.name}
+                          onFocus={() => setActiveLoraRowId(row.id)}
+                          onBlur={() => {
+                            setTimeout(() => {
+                              setActiveLoraRowId((current) => (current === row.id ? null : current));
+                            }, 120);
+                          }}
+                          onChange={(event) =>
+                            setLoraRows((rows) =>
+                              rows.map((item) => (item.id === row.id ? { ...item, name: event.target.value } : item))
+                            )
+                          }
+                        />
+                        {activeLoraRowId === row.id && !loraDisabled && (
+                          <div className="absolute z-20 mt-1 max-h-56 w-full overflow-auto rounded-md border border-slate-800 bg-slate-950 text-sm text-slate-200 shadow-lg">
+                            {filterLoraNames(options.loraNames, row.name).length === 0 ? (
+                              <div className="px-3 py-2 text-xs text-slate-500">No matches</div>
+                            ) : (
+                              filterLoraNames(options.loraNames, row.name).map((name) => (
+                                <button
+                                  key={name}
+                                  type="button"
+                                  onMouseDown={(event) => event.preventDefault()}
+                                  onClick={() => {
+                                    setLoraRows((rows) =>
+                                      rows.map((item) => (item.id === row.id ? { ...item, name } : item))
+                                    );
+                                    setActiveLoraRowId(null);
+                                  }}
+                                  className="block w-full px-3 py-2 text-left text-xs text-slate-200 transition hover:bg-slate-800"
+                                >
+                                  {name}
+                                </button>
+                              ))
+                            )}
+                            {options.loraNames.length > LORA_RESULT_LIMIT && (
+                              <div className="px-3 py-2 text-[11px] text-slate-500">
+                                Showing first {LORA_RESULT_LIMIT} results
+                              </div>
+                            )}
                           </div>
                         )}
                       </div>
-                    )}
+                      <input
+                        type="number"
+                        step="0.05"
+                        value={row.weight}
+                        onChange={(event) =>
+                          setLoraRows((rows) =>
+                            rows.map((item) => (item.id === row.id ? { ...item, weight: event.target.value } : item))
+                          )
+                        }
+                        className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none"
+                        placeholder="Weight"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveLora(row.id)}
+                        className="rounded-md border border-slate-700 px-3 py-2 text-xs text-slate-200 transition hover:border-rose-400/60 hover:text-white"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                    <div className="rounded-md border border-slate-800 bg-slate-900/60 px-3 py-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="text-xs font-semibold text-slate-300">Trigger suggestions</div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void handleInsertLoraTriggers(row.name);
+                          }}
+                          disabled={!hasLoraName}
+                          className="rounded-md border border-slate-700 px-2 py-1 text-xs text-slate-200 transition hover:border-emerald-400/60 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          Insert
+                        </button>
+                      </div>
+                      {!hasLoraName ? (
+                        <div className="mt-2 text-xs text-slate-500">Select a LoRA to load triggers.</div>
+                      ) : rowTriggers.length === 0 ? (
+                        <div className="mt-2 text-xs text-slate-500">No triggers</div>
+                      ) : (
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          {rowTriggers.map((token) => {
+                            const disabled = positiveTokenKeys.has(normalizeTokenKey(token));
+                            return (
+                              <button
+                                key={token}
+                                type="button"
+                                onClick={() => insertPositiveTokens([token])}
+                                disabled={disabled}
+                                className="rounded-full border border-slate-700 px-3 py-1 text-xs text-slate-100 transition hover:border-emerald-400/70 hover:text-white disabled:cursor-not-allowed disabled:border-slate-800 disabled:text-slate-500"
+                              >
+                                {token}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
                   </div>
-                  <input
-                    type="number"
-                    step="0.05"
-                  value={row.weight}
-                  onChange={(event) =>
-                    setLoraRows((rows) =>
-                      rows.map((item) => (item.id === row.id ? { ...item, weight: event.target.value } : item))
-                    )
-                  }
-                  className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none"
-                  placeholder="Weight"
-                />
-                <button
-                  type="button"
-                  onClick={() => handleRemoveLora(row.id)}
-                  className="rounded-md border border-slate-700 px-3 py-2 text-xs text-slate-200 transition hover:border-rose-400/60 hover:text-white"
-                >
-                  Remove
-                </button>
-              </div>
-            ))}
-          </div>
-        </section>
+                );
+              })}
+            </div>
+          </section>
 
           <section className="rounded-2xl border border-slate-800 bg-slate-950/60 p-6 shadow-lg shadow-black/40">
             <div className="flex items-center justify-between">

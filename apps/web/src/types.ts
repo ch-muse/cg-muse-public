@@ -41,6 +41,7 @@ export interface PromptBlocks {
 export interface Lora {
   id: string;
   name: string;
+  fileName: string | null;
   trigger_words: string[];
   recommended_weight_min: number | null;
   recommended_weight_max: number | null;
@@ -160,6 +161,7 @@ export interface GalleryItem {
   source_type: string;
   source_id: string | null;
   comfy_run_id: string | null;
+  recipe_id?: string | null;
   rel_path: string | null;
   prompt_id: string | null;
   filename: string;

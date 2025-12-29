@@ -23,6 +23,7 @@ export default function WorkshopLoraForm() {
 
   const [form, setForm] = useState({
     name: "",
+    fileName: "",
     triggerWords: "",
     recommendedWeightMin: "",
     recommendedWeightMax: "",
@@ -49,6 +50,7 @@ export default function WorkshopLoraForm() {
         setLora(data.lora);
         setForm({
           name: data.lora.name,
+          fileName: data.lora.fileName ?? "",
           triggerWords: data.lora.trigger_words.join(", "),
           recommendedWeightMin: data.lora.recommended_weight_min !== null ? String(data.lora.recommended_weight_min) : "",
           recommendedWeightMax: data.lora.recommended_weight_max !== null ? String(data.lora.recommended_weight_max) : "",
@@ -86,6 +88,7 @@ export default function WorkshopLoraForm() {
 
     const payload = {
       name: form.name.trim(),
+      fileName: form.fileName.trim() ? form.fileName.trim() : null,
       triggerWords: splitInput(form.triggerWords),
       recommendedWeightMin: weightMin,
       recommendedWeightMax: weightMax,
@@ -255,6 +258,18 @@ export default function WorkshopLoraForm() {
                 />
               </label>
             </div>
+
+            <label className="block text-sm">
+              <span className="text-slate-200">File name (ComfyUI)</span>
+              <input
+                type="text"
+                value={form.fileName}
+                onChange={(event) => setForm((prev) => ({ ...prev, fileName: event.target.value }))}
+                className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white focus:border-emerald-400 focus:outline-none"
+                placeholder="my_lora.safetensors"
+              />
+              <span className="mt-1 block text-xs text-slate-400">ComfyUI側の LoRA ファイル名（拡張子込み推奨）</span>
+            </label>
 
             <div className="grid gap-4 md:grid-cols-2">
               <label className="block text-sm">

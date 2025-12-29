@@ -53,6 +53,7 @@ export default function WorkshopLorasList() {
     return loras.filter((lora) => {
       const fields = [
         lora.name,
+        lora.fileName ?? "",
         ...(lora.trigger_words ?? []),
         ...(Array.isArray(lora.tags) ? lora.tags : [])
       ].map((value) => normalize(String(value || "")));
@@ -148,7 +149,12 @@ export default function WorkshopLorasList() {
                         )}
                       </div>
                     </td>
-                    <td className="px-4 py-3 text-white">{lora.name}</td>
+                    <td className="px-4 py-3">
+                      <div className="space-y-1">
+                        <div className="text-white">{lora.name}</div>
+                        {lora.fileName ? <div className="text-xs text-slate-400">{lora.fileName}</div> : null}
+                      </div>
+                    </td>
                     <td className="px-4 py-3 text-slate-200">{summarize(lora.trigger_words)}</td>
                     <td className="px-4 py-3 text-slate-200">{summarize(lora.tags)}</td>
                     <td className="px-4 py-3 text-slate-400">{formatDate(lora.updated_at || lora.created_at)}</td>
