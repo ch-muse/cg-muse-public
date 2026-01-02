@@ -1,4 +1,5 @@
 import { type KeyboardEvent, type FocusEvent, type ChangeEvent, type HTMLAttributes, type ReactNode } from "react";
+import { RefreshCcw, X } from "lucide-react";
 
 type TranslationEntry = {
   status: "pending" | "done" | "error";
@@ -60,12 +61,12 @@ export default function PromptChip({
           onBlur={handleBlur}
           onPointerDown={(event) => event.stopPropagation()}
           autoFocus
-          className="w-40 bg-transparent text-xs text-slate-100 focus:outline-none"
+          className="w-40 bg-transparent text-sm text-slate-100 focus:outline-none"
         />
         <button
           type="button"
           onClick={onEditCancel}
-          className="text-[10px] text-slate-400 transition hover:text-slate-100"
+          className="text-xs text-slate-400 transition hover:text-slate-100"
         >
           Esc
         </button>
@@ -85,10 +86,10 @@ export default function PromptChip({
     translation?.status === "error" ? translation.error ?? "翻訳失敗" : translationLabel ?? null;
   const translationClass =
     translation?.status === "error"
-      ? "text-[10px] text-rose-300"
+      ? "text-xs text-rose-300"
       : translation?.status === "pending"
-        ? "text-[10px] text-slate-500"
-        : "text-[10px] text-slate-400";
+        ? "text-xs text-slate-500"
+        : "text-xs text-slate-400";
 
   return (
     <div
@@ -103,7 +104,7 @@ export default function PromptChip({
         title={translationTooltip ?? undefined}
         className="min-w-0 text-left"
       >
-        <span className="block max-w-[14rem] truncate text-xs text-slate-100">{value}</span>
+        <span className="block max-w-[14rem] truncate text-sm text-slate-100">{value}</span>
         {translationLabel && <span className={translationClass}>{translationLabel}</span>}
       </button>
       <div className="flex items-center gap-1">
@@ -113,21 +114,23 @@ export default function PromptChip({
             type="button"
             onClick={onRetranslate}
             onPointerDown={(event) => event.stopPropagation()}
+            title="Re-translate token"
             aria-label="Re-translate token"
             disabled={translation?.status === "pending"}
-            className="flex h-7 w-7 items-center justify-center rounded-full text-[11px] text-slate-300 opacity-0 transition hover:bg-slate-700/40 hover:text-slate-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/60 disabled:cursor-not-allowed disabled:opacity-30 group-hover:opacity-100"
+            className="flex h-8 w-8 min-h-8 min-w-8 items-center justify-center rounded-full text-slate-300 opacity-0 transition hover:bg-slate-700/40 hover:text-slate-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/60 disabled:cursor-not-allowed disabled:opacity-30 group-hover:opacity-100"
           >
-            ↻
+            <RefreshCcw className="h-3.5 w-3.5" aria-hidden="true" />
           </button>
         )}
         <button
           type="button"
           onClick={onRemove}
           onPointerDown={(event) => event.stopPropagation()}
+          title="Remove token"
           aria-label="Remove token"
-          className="flex h-7 w-7 items-center justify-center rounded-full text-xs text-rose-300 transition hover:bg-rose-500/10 hover:text-rose-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-rose-300/50"
+          className="flex h-8 w-8 min-h-8 min-w-8 items-center justify-center rounded-full text-rose-300 transition hover:bg-rose-500/10 hover:text-rose-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-rose-300/50"
         >
-          ×
+          <X className="h-3.5 w-3.5" aria-hidden="true" />
         </button>
       </div>
     </div>

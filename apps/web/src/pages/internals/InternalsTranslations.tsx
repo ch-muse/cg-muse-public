@@ -233,7 +233,7 @@ export default function InternalsTranslationsPage() {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), TRANSLATE_TIMEOUT_MS);
       try {
-        const response = await fetch(`${API_BASE_URL}/api/ollama/translate-tags`, {
+        const response = await fetch(`${API_BASE_URL}/api/translate/tags`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ tags: [tag], force: true }),

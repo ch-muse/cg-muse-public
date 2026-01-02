@@ -46,6 +46,11 @@ const OLLAMA_TRANSLATE_MODEL = (process.env.OLLAMA_TRANSLATE_MODEL || "gpt-oss:2
 const OLLAMA_NUM_GPU = Number.isFinite(Number(process.env.OLLAMA_NUM_GPU))
   ? Number(process.env.OLLAMA_NUM_GPU)
   : undefined;
+const DEEPL_AUTH_KEY = (process.env.DEEPL_AUTH_KEY || "").trim();
+const DEEPL_API_BASE_URL = (process.env.DEEPL_API_BASE_URL || "https://api-free.deepl.com")
+  .trim()
+  .replace(/\/+$/, "");
+const DEEPL_TIMEOUT_MS = 12_000;
 const COMFY_BASE_URL = (process.env.COMFY_BASE_URL || "http://127.0.0.1:8188").trim().replace(/\/+$/, "");
 const COMFY_OBJECT_INFO_TIMEOUT_MS = 4000;
 const COMFY_OBJECT_INFO_CACHE_TTL_MS = 60_000;
@@ -56,6 +61,8 @@ const COMFY_HISTORY_GRACE_MS = Number.isFinite(Number(process.env.COMFY_HISTORY_
 const COMFY_TAGGER_POLL_INTERVAL_MS = 2000;
 const COMFY_TAGGER_POLL_TIMEOUT_MS = 60_000;
 const { root: WORKSHOP_ROOT, recipeThumbsDir: RECIPE_THUMBS_DIR, loraThumbsDir: LORA_THUMBS_DIR } = getWorkshopPaths();
+const COMFY_PREVIEW_OUTPUTS_SUBDIR = "comfy_previews";
+const COMFY_PREVIEW_OUTPUTS_DIR = path.join(WORKSHOP_ROOT, COMFY_PREVIEW_OUTPUTS_SUBDIR);
 const {
   taggerInputsDir: COMFY_TAGGER_INPUTS_DIR
 } = getComfyPaths();
@@ -145,6 +152,96 @@ const encodeMediaKey = (value: string) =>
     .split("/")
     .map((segment) => encodeURIComponent(segment))
     .join("/");
+
+const sanitizePreviewFilename = (value: string) => {
+  const base = path.basename(value || "").trim();
+  const sanitized = base.replace(/[^a-zA-Z0-9._-]/g, "_");
+  if (!sanitized) return `preview_${randomUUID()}.png`;
+  if (path.extname(sanitized)) return sanitized;
+  return `${sanitized}.png`;
+};
+
+const buildPreviewFilename = (runId: string, nodeId: string | null, filename: string) => {
+  const safeName = sanitizePreviewFilename(filename);
+  const nodePart = nodeId ? nodeId.replace(/[^a-zA-Z0-9._-]/g, "_") : "preview";
+  return `${runId}_${nodePart}_${safeName}`;
+};
+
+const fetchComfyImageBuffer = async (image: ComfyOutputImage) => {
+  const query = new URLSearchParams({ filename: image.filename });
+  if (image.subfolder) query.set("subfolder", image.subfolder);
+  if (image.type) query.set("type", image.type);
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), COMFY_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${COMFY_BASE_URL}/view?${query.toString()}`, { signal: controller.signal });
+    if (!response.ok) {
+      const text = await response.text();
+      console.error("Comfy preview fetch failed", {
+        status: response.status,
+        body: truncateText(text),
+        filename: image.filename
+      });
+      return null;
+    }
+    return Buffer.from(await response.arrayBuffer());
+  } catch (err) {
+    const isTimeout = err instanceof Error && err.name === "AbortError";
+    console.error("Comfy preview fetch failed", {
+      message: isTimeout ? "timeout" : "comfy_unreachable",
+      error: err instanceof Error ? err.message : String(err),
+      filename: image.filename
+    });
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+};
+
+const persistComfyPreviewImage = async (image: ComfyOutputImage, runId: string) => {
+  const buffer = await fetchComfyImageBuffer(image);
+  if (!buffer) return null;
+  const filename = buildPreviewFilename(runId, image.nodeId ?? null, image.filename);
+  await fs.promises.mkdir(COMFY_PREVIEW_OUTPUTS_DIR, { recursive: true });
+  const relPath = path.posix.join(COMFY_PREVIEW_OUTPUTS_SUBDIR, filename);
+  const targetPath = path.join(COMFY_PREVIEW_OUTPUTS_DIR, filename);
+  await fs.promises.writeFile(targetPath, buffer);
+  return {
+    ...image,
+    filename,
+    subfolder: null,
+    type: null,
+    relPath
+  };
+};
+
+const materializePreviewOutputs = async (
+  outputs: ComfyOutputImage[],
+  previewNodeIds: Set<string> | null,
+  runId: string
+) => {
+  if (!previewNodeIds || previewNodeIds.size === 0) return outputs;
+  const next: ComfyOutputImage[] = [];
+  for (const output of outputs) {
+    if (!output.nodeId || !previewNodeIds.has(output.nodeId)) {
+      next.push(output);
+      continue;
+    }
+    try {
+      const persisted = await persistComfyPreviewImage(output, runId);
+      next.push(persisted ?? output);
+    } catch (err) {
+      console.error("Failed to persist Comfy preview image", {
+        runId,
+        nodeId: output.nodeId,
+        error: err instanceof Error ? err.message : String(err)
+      });
+      next.push(output);
+    }
+  }
+  return next;
+};
 
 const TAG_DICTIONARY_CSV_MAX_BYTES = 50 * 1024 * 1024;
 const TAG_DICTIONARY_TMP_DIR = path.join(os.tmpdir(), "cg-muse");
@@ -370,9 +467,13 @@ const buildComfyViewUrl = (item: {
   filename: string;
   subfolder?: string | null;
   file_type?: string | null;
+  rel_path?: string | null;
 }) => {
   if (item.source_type === "folder") {
     return `/api/gallery/items/${item.id}/file`;
+  }
+  if (item.rel_path) {
+    return `/media/${encodeMediaKey(item.rel_path)}`;
   }
   const params = new URLSearchParams({ filename: item.filename });
   if (item.subfolder) params.set("subfolder", item.subfolder);
@@ -555,6 +656,7 @@ type ComfyOutputImage = {
   subfolder?: string | null;
   type?: string | null;
   nodeId?: string | null;
+  relPath?: string | null;
 };
 
 type ComfyTemplateDefaults = {
@@ -1592,7 +1694,13 @@ const buildOllamaOptions = () => {
 
 const translateTagsRequestSchema = z.object({
   tags: z.array(z.string()),
-  force: z.boolean().optional()
+  force: z.boolean().optional(),
+  targetLang: z.string().optional()
+});
+
+const translatePersistentSearchSchema = z.object({
+  q: z.string().trim().min(1),
+  limit: z.coerce.number().int().min(1).max(200)
 });
 
 const translateTagsFormat = {
@@ -1637,6 +1745,218 @@ const parseTranslateResponse = (content: string) => {
     }
   }
   return normalized;
+};
+
+type TranslationProvider = "deepl" | "ollama";
+
+type TranslationError = {
+  status: number;
+  message: string;
+  details?: Record<string, unknown>;
+};
+
+type TranslationResult =
+  | { ok: true; translations: Record<string, string> }
+  | { ok: false; error: TranslationError };
+
+const updateTranslateCacheEntries = (translations: Record<string, string>) => {
+  const expiresAt = Date.now() + TRANSLATE_CACHE_TTL_MS;
+  for (const [tag, value] of Object.entries(translations)) {
+    translateCache.set(tag, { value, expiresAt });
+  }
+};
+
+const fetchPersistedTranslations = async (tags: string[]) => {
+  if (tags.length === 0) return {};
+  const lookup = uniqStrings(tags.map((tag) => tag.toLowerCase()));
+  try {
+    const result = await pool.query("SELECT tag, ja FROM tag_translations WHERE lower(tag) = ANY($1)", [lookup]);
+    const byLower = new Map<string, string>();
+    for (const row of result.rows as Array<{ tag?: string; ja?: string }>) {
+      if (typeof row.tag !== "string" || typeof row.ja !== "string") continue;
+      const trimmed = row.ja.trim();
+      if (!trimmed) continue;
+      byLower.set(row.tag.toLowerCase(), trimmed);
+    }
+    const translations: Record<string, string> = {};
+    for (const tag of tags) {
+      const hit = byLower.get(tag.toLowerCase());
+      if (hit) translations[tag] = hit;
+    }
+    return translations;
+  } catch (err) {
+    console.error("Failed to load persisted translations", err);
+    return {};
+  }
+};
+
+const persistTranslatedTags = async (translations: Record<string, string>, provider: TranslationProvider) => {
+  const entries = Object.entries(translations)
+    .map(([tag, ja]) => ({ tag: tag.trim(), ja: ja.trim() }))
+    .filter((item) => item.tag.length > 0 && item.ja.length > 0);
+  if (entries.length === 0) return;
+
+  const values: Array<string> = [];
+  const rows: string[] = [];
+  let idx = 1;
+  for (const entry of entries) {
+    rows.push(`($${idx++}, $${idx++}, $${idx++})`);
+    values.push(entry.tag, entry.ja, provider);
+  }
+  await pool.query(
+    `INSERT INTO tag_translations (tag, ja, source)
+     VALUES ${rows.join(", ")}
+     ON CONFLICT (tag) DO UPDATE
+       SET ja = EXCLUDED.ja,
+           source = EXCLUDED.source,
+           updated_at = NOW()`,
+    values
+  );
+};
+
+const requestOllamaTranslations = async (tags: string[]): Promise<TranslationResult> => {
+  const messages = buildTranslateMessages(tags);
+  const options = buildOllamaOptions();
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, OLLAMA_TIMEOUT_MS);
+  let rawContent = "";
+
+  try {
+    const response = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: OLLAMA_TRANSLATE_MODEL,
+        stream: false,
+        messages,
+        format: translateTagsFormat,
+        keep_alive: OLLAMA_KEEP_ALIVE,
+        options
+      }),
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      return {
+        ok: false,
+        error: {
+          status: 502,
+          message: "Failed to call Ollama",
+          details: {
+            url: `${OLLAMA_BASE_URL}/api/chat`,
+            status: response.status,
+            body: truncateText(text)
+          }
+        }
+      };
+    }
+
+    const data = (await response.json()) as { message?: { content?: string } };
+    rawContent = data?.message?.content ?? "";
+  } catch (err) {
+    const errName =
+      err && typeof err === "object" && "name" in err && typeof (err as any).name === "string" ? (err as any).name : "";
+    const isTimeout = timedOut || errName === "AbortError" || errName === "TimeoutError";
+    return {
+      ok: false,
+      error: {
+        status: isTimeout ? 504 : 500,
+        message: isTimeout ? "Ollama request timed out" : "Failed to call Ollama",
+        details: {
+          url: `${OLLAMA_BASE_URL}/api/chat`,
+          error: err instanceof Error ? err.message : String(err),
+          timeout_ms: OLLAMA_TIMEOUT_MS
+        }
+      }
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  const parsedTranslations = parseTranslateResponse(rawContent);
+  if (!parsedTranslations) {
+    return { ok: false, error: { status: 500, message: "LLM returned invalid JSON", details: { raw: truncateText(rawContent, 4000) } } };
+  }
+
+  const translations: Record<string, string> = {};
+  for (const tag of tags) {
+    const raw = parsedTranslations[tag];
+    translations[tag] = typeof raw === "string" && raw.trim().length > 0 ? raw.trim() : tag;
+  }
+  return { ok: true, translations };
+};
+
+const requestDeepLTranslations = async (tags: string[], targetLang: string): Promise<TranslationResult> => {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), DEEPL_TIMEOUT_MS);
+  let responseText = "";
+
+  try {
+    const params = new URLSearchParams();
+    params.set("auth_key", DEEPL_AUTH_KEY);
+    for (const tag of tags) {
+      params.append("text", tag);
+    }
+    params.set("target_lang", targetLang);
+
+    const response = await fetch(`${DEEPL_API_BASE_URL}/v2/translate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: params.toString(),
+      signal: controller.signal
+    });
+
+    responseText = await response.text();
+    if (!response.ok) {
+      return {
+        ok: false,
+        error: {
+          status: response.status,
+          message: "Failed to call DeepL",
+          details: { status: response.status, body: truncateText(responseText) }
+        }
+      };
+    }
+
+    let payload: any = null;
+    try {
+      payload = responseText ? JSON.parse(responseText) : null;
+    } catch (err) {
+      return {
+        ok: false,
+        error: { status: 500, message: "DeepL returned invalid JSON", details: { error: String(err) } }
+      };
+    }
+
+    const items = payload?.translations;
+    if (!Array.isArray(items)) {
+      return { ok: false, error: { status: 500, message: "DeepL returned invalid response" } };
+    }
+
+    const translations: Record<string, string> = {};
+    for (let i = 0; i < tags.length; i += 1) {
+      const raw = items[i]?.text;
+      translations[tags[i]] = typeof raw === "string" && raw.trim().length > 0 ? raw.trim() : tags[i];
+    }
+    return { ok: true, translations };
+  } catch (err) {
+    const isTimeout = err instanceof Error && err.name === "AbortError";
+    return {
+      ok: false,
+      error: {
+        status: isTimeout ? 504 : 500,
+        message: isTimeout ? "DeepL request timed out" : "Failed to call DeepL",
+        details: { error: err instanceof Error ? err.message : String(err) }
+      }
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
 };
 
 const logEvent = async (db: Queryable, sessionId: string, eventType: string, payload: unknown) => {
@@ -2306,7 +2626,12 @@ app.post(
 
     if (nextStatus === "succeeded" && outputs.length > 0) {
       try {
-        const items = buildGalleryItemsFromRun(updatedRun, outputs);
+        const outputsForGallery = await materializePreviewOutputs(
+          outputs,
+          preprocessorPreviewNodeIds ?? null,
+          updatedRun.id
+        );
+        const items = buildGalleryItemsFromRun(updatedRun, outputsForGallery);
         await upsertGalleryItems(pool, items);
       } catch (err) {
         console.error("Gallery sync failed", { runId: runId.data, error: err });
@@ -2757,6 +3082,139 @@ app.get(
 );
 
 app.post(
+  "/api/translate/tags",
+  asyncHandler(async (req, res) => {
+    const parsed = translateTagsRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return respondError(res, 400, "Invalid request", parsed.error.flatten());
+    }
+
+    const force = parsed.data.force === true;
+    const targetLang =
+      typeof parsed.data.targetLang === "string" && parsed.data.targetLang.trim()
+        ? parsed.data.targetLang.trim().toUpperCase()
+        : "JA";
+    const tags = parsed.data.tags
+      .filter((tag) => typeof tag === "string")
+      .map((tag) => tag.trim())
+      .filter((tag) => tag.length > 0);
+    if (tags.length === 0) {
+      return respondError(res, 400, "tags are required");
+    }
+
+    const uniqueTags = uniqStrings(tags);
+    const translations: Record<string, string> = {};
+    let pendingTags = uniqueTags;
+
+    if (!force) {
+      const now = Date.now();
+      pendingTags = [];
+      for (const tag of uniqueTags) {
+        const cached = translateCache.get(tag);
+        if (cached && cached.expiresAt > now) {
+          translations[tag] = cached.value;
+        } else {
+          pendingTags.push(tag);
+        }
+      }
+
+      if (pendingTags.length > 0) {
+        const persisted = await fetchPersistedTranslations(pendingTags);
+        if (Object.keys(persisted).length > 0) {
+          for (const [tag, ja] of Object.entries(persisted)) {
+            translations[tag] = ja;
+          }
+          updateTranslateCacheEntries(persisted);
+        }
+        pendingTags = pendingTags.filter((tag) => !(tag in persisted));
+      }
+    }
+
+    let provider: TranslationProvider = DEEPL_AUTH_KEY ? "deepl" : "ollama";
+    const newlyTranslated: Record<string, string> = {};
+
+    if (pendingTags.length > 0) {
+      if (DEEPL_AUTH_KEY) {
+        const result = await requestDeepLTranslations(pendingTags, targetLang);
+        if (result.ok) {
+          provider = "deepl";
+          for (const [tag, ja] of Object.entries(result.translations)) {
+            translations[tag] = ja;
+            newlyTranslated[tag] = ja;
+          }
+          updateTranslateCacheEntries(result.translations);
+        } else {
+          const fallback = await requestOllamaTranslations(pendingTags);
+          if (!fallback.ok) {
+            return respondError(res, fallback.error.status, fallback.error.message, fallback.error.details);
+          }
+          provider = "ollama";
+          for (const [tag, ja] of Object.entries(fallback.translations)) {
+            translations[tag] = ja;
+            newlyTranslated[tag] = ja;
+          }
+          updateTranslateCacheEntries(fallback.translations);
+        }
+      } else {
+        const fallback = await requestOllamaTranslations(pendingTags);
+        if (!fallback.ok) {
+          return respondError(res, fallback.error.status, fallback.error.message, fallback.error.details);
+        }
+        provider = "ollama";
+        for (const [tag, ja] of Object.entries(fallback.translations)) {
+          translations[tag] = ja;
+          newlyTranslated[tag] = ja;
+        }
+        updateTranslateCacheEntries(fallback.translations);
+      }
+    }
+
+    if (Object.keys(newlyTranslated).length > 0) {
+      void persistTranslatedTags(newlyTranslated, provider).catch((err) => {
+        console.error("Failed to persist translated tags", err);
+      });
+    }
+
+    res.json({ ok: true, data: { translations, provider } });
+  })
+);
+
+app.get(
+  "/api/translate/persistent/search",
+  asyncHandler(async (req, res) => {
+    const parsed = translatePersistentSearchSchema.safeParse(req.query);
+    if (!parsed.success) {
+      return respondError(res, 400, "Invalid request", parsed.error.flatten());
+    }
+    const query = parsed.data.q.trim();
+    const limit = parsed.data.limit;
+    const pattern = `%${query}%`;
+
+    const result = await pool.query(
+      `SELECT tag, ja, seen_count
+       FROM tag_translations
+       WHERE ja ILIKE $1
+       ORDER BY seen_count DESC NULLS LAST, ja ASC, tag ASC
+       LIMIT $2`,
+      [pattern, limit]
+    );
+
+    const results = result.rows.map((row) => {
+      const rawCount = row.seen_count;
+      const observedCount =
+        typeof rawCount === "number" ? rawCount : typeof rawCount === "string" ? Number(rawCount) : undefined;
+      return {
+        tag: row.tag,
+        ja: row.ja,
+        ...(Number.isFinite(observedCount) ? { observedCount } : {})
+      };
+    });
+
+    res.json({ ok: true, data: { results } });
+  })
+);
+
+app.post(
   "/api/ollama/translate-tags",
   asyncHandler(async (req, res) => {
     const parsed = translateTagsRequestSchema.safeParse(req.body);
@@ -2792,70 +3250,14 @@ app.post(
     }
 
     if (pendingTags.length > 0) {
-      const messages = buildTranslateMessages(pendingTags);
-      const options = buildOllamaOptions();
-      const controller = new AbortController();
-      let timedOut = false;
-      const timeoutId = setTimeout(() => {
-        timedOut = true;
-        controller.abort();
-      }, OLLAMA_TIMEOUT_MS);
-      let rawContent = "";
-
-      try {
-        const response = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: OLLAMA_TRANSLATE_MODEL,
-            stream: false,
-            messages,
-            format: translateTagsFormat,
-            keep_alive: OLLAMA_KEEP_ALIVE,
-            options
-          }),
-          signal: controller.signal
-        });
-
-        if (!response.ok) {
-          const text = await response.text();
-          const truncated = truncateText(text);
-          clearTimeout(timeoutId);
-          return respondError(res, 502, "Failed to call Ollama", {
-            url: `${OLLAMA_BASE_URL}/api/chat`,
-            status: response.status,
-            body: truncated
-          });
-        }
-
-        const data = (await response.json()) as { message?: { content?: string } };
-        rawContent = data?.message?.content ?? "";
-      } catch (err) {
-        clearTimeout(timeoutId);
-        const errName =
-          err && typeof err === "object" && "name" in err && typeof (err as any).name === "string" ? (err as any).name : "";
-        const isTimeout = timedOut || errName === "AbortError" || errName === "TimeoutError";
-        return respondError(res, isTimeout ? 504 : 500, isTimeout ? "Ollama request timed out" : "Failed to call Ollama", {
-          url: `${OLLAMA_BASE_URL}/api/chat`,
-          error: err instanceof Error ? err.message : String(err),
-          timeout_ms: OLLAMA_TIMEOUT_MS
-        });
-      } finally {
-        clearTimeout(timeoutId);
+      const result = await requestOllamaTranslations(pendingTags);
+      if (!result.ok) {
+        return respondError(res, result.error.status, result.error.message, result.error.details);
       }
-
-      const parsedTranslations = parseTranslateResponse(rawContent);
-      if (!parsedTranslations) {
-        return respondError(res, 500, "LLM returned invalid JSON", { raw: truncateText(rawContent, 4000) });
-      }
-
-      const expiresAt = Date.now() + TRANSLATE_CACHE_TTL_MS;
       for (const tag of pendingTags) {
-        const raw = parsedTranslations[tag];
-        const resolved = typeof raw === "string" && raw.trim().length > 0 ? raw.trim() : tag;
-        translations[tag] = resolved;
-        translateCache.set(tag, { value: resolved, expiresAt });
+        translations[tag] = result.translations[tag] ?? tag;
       }
+      updateTranslateCacheEntries(result.translations);
     }
 
     res.json({ ok: true, data: { translations } });

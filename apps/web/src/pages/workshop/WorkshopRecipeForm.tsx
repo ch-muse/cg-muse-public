@@ -1,6 +1,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useLocation } from "react-router-dom";
 import { api, ApiClientError, API_BASE_URL } from "../../lib/api.js";
+import ImageDropPaste from "../../components/common/ImageDropPaste.js";
 import PromptComposer from "../../components/prompt/PromptComposer.js";
 import type { GalleryItem, Lora, Recipe, RecipeLoraLink, RecipeTarget } from "../../types.js";
 
@@ -747,15 +748,13 @@ export default function WorkshopRecipeForm() {
               </div>
             </div>
             <div className="space-y-3 md:col-span-2">
-              <label className="block text-sm text-slate-200">
-                <span className="text-slate-200">Upload new thumbnail</span>
-                <input
-                  type="file"
-                  accept="image/png,image/jpeg,image/webp"
-                  onChange={(event) => setThumbnailFile(event.target.files?.[0] ?? null)}
-                  className="mt-1 w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white focus:border-emerald-400 focus:outline-none file:mr-3 file:rounded-md file:border-0 file:bg-slate-800 file:px-3 file:py-2 file:text-sm file:text-slate-200"
-                />
-              </label>
+              <ImageDropPaste
+                label="Upload new thumbnail"
+                valueFile={thumbnailFile}
+                onChangeFile={setThumbnailFile}
+                accept="image/png,image/jpeg,image/webp"
+                maxSizeBytes={5 * 1024 * 1024}
+              />
               <div className="flex flex-wrap items-center gap-3 text-xs text-slate-400">
                 <button
                   type="button"
@@ -777,19 +776,18 @@ export default function WorkshopRecipeForm() {
             <p className="text-sm text-slate-400">この画像は作成後のサムネイルとしても保存されます。</p>
           </div>
           <div className="space-y-3">
-            <label className="block text-sm text-slate-200">
-              <span className="text-slate-200">Image</span>
-              <input
-                type="file"
-                accept="image/png,image/jpeg,image/webp"
-                onChange={(event) => {
-                  setThumbnailFile(event.target.files?.[0] ?? null);
-                  setTaggerError(null);
-                  setTaggerMessage(null);
-                }}
-                className="mt-1 w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white focus:border-emerald-400 focus:outline-none file:mr-3 file:rounded-md file:border-0 file:bg-slate-800 file:px-3 file:py-2 file:text-sm file:text-slate-200"
-              />
-            </label>
+            <ImageDropPaste
+              label="Image"
+              valueFile={thumbnailFile}
+              onChangeFile={(file) => {
+                setThumbnailFile(file);
+                setTaggerError(null);
+                setTaggerMessage(null);
+              }}
+              accept="image/png,image/jpeg,image/webp"
+              maxSizeBytes={5 * 1024 * 1024}
+              helpText="png / jpeg / webp（5MBまで、1枚のみ）"
+            />
             <div className="flex flex-wrap items-center gap-3 text-xs text-slate-400">
               <button
                 type="button"
@@ -799,7 +797,6 @@ export default function WorkshopRecipeForm() {
               >
                 {taggerLoading ? "Tagger 実行中..." : "Run tagger"}
               </button>
-              {thumbnailFile && <span>Selected: {thumbnailFile.name}</span>}
             </div>
             {taggerError && <p className="text-sm text-red-200">Error: {taggerError}</p>}
             {taggerMessage && <p className="text-sm text-emerald-200">{taggerMessage}</p>}
@@ -881,8 +878,8 @@ export default function WorkshopRecipeForm() {
               </label>
             </div>
 
-            <div className="grid gap-4 md:grid-cols-3">
-              <div className="md:col-span-1">
+            <div className="grid gap-4">
+              <div>
                 <PromptComposer
                   label="Prompt Positive"
                   target="positive"
@@ -892,7 +889,7 @@ export default function WorkshopRecipeForm() {
                   placeholder="Add tags..."
                 />
               </div>
-              <div className="md:col-span-1">
+              <div>
                 <PromptComposer
                   label="Prompt Negative"
                   target="negative"
@@ -902,7 +899,7 @@ export default function WorkshopRecipeForm() {
                   placeholder="Add tags..."
                 />
               </div>
-              <label className="block text-sm md:col-span-1">
+              <label className="block text-sm">
                 <span className="text-slate-200">Notes</span>
                 <textarea
                   value={form.notes}

@@ -53,6 +53,9 @@ type TagSuggestion = {
   type?: string;
   count?: number;
   aliases?: string[];
+  ja?: string;
+  observedCount?: number;
+  source?: "dictionary" | "persistent";
 };
 
 type TagGroup = {
@@ -114,8 +117,9 @@ const TRANSLATE_TIMEOUT_MS = 90000;
 const LOOKUP_BATCH_SIZE = 200;
 const LOOKUP_TIMEOUT_MS = 12000;
 const SUGGEST_DEBOUNCE_MS = 260;
-const SUGGEST_TIMEOUT_MS = 8000;
+const SUGGEST_TIMEOUT_MS = 4000;
 const DICTIONARY_LOOKUP_TIMEOUT_MS = 8000;
+const JAPANESE_QUERY_PATTERN = /[\u3040-\u30FF\u4E00-\u9FFF]/;
 const DICTIONARY_CACHE_TTL_MS = 10 * 60 * 1000;
 type TranslationStatus = "pending" | "done" | "error";
 
@@ -676,6 +680,7 @@ export default function PromptComposer({
   const [activeId, setActiveId] = useState<string | null>(null);
   const [overId, setOverId] = useState<string | null>(null);
   const [translationState, setTranslationState] = useState<Map<string, TranslationEntry>>(() => new Map());
+  const [translateTick, setTranslateTick] = useState(0);
   const [persistentReady, setPersistentReady] = useState(isTranslationCacheReady());
   const [dedupNotice, setDedupNotice] = useState<string | null>(null);
   const suggestTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -690,6 +695,7 @@ export default function PromptComposer({
   const lookupTagRequestIdRef = useRef(new Map<string, number>());
   const translateRequestIdRef = useRef(0);
   const forceQueueRef = useRef(new Set<string>());
+  const translateQueueRef = useRef(new Set<string>());
   const tokenSetRef = useRef<Set<string>>(new Set());
   const activeRef = useRef(true);
   const dedupNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -871,8 +877,20 @@ export default function PromptComposer({
 
     if (nextSet.size === 0) {
       forceQueueRef.current.clear();
+      translateQueueRef.current.clear();
       setTranslationState((prev) => (prev.size === 0 ? prev : new Map()));
       return;
+    }
+
+    for (const tag of forceQueueRef.current) {
+      if (!nextSet.has(tag)) {
+        forceQueueRef.current.delete(tag);
+      }
+    }
+    for (const tag of translateQueueRef.current) {
+      if (!nextSet.has(tag)) {
+        translateQueueRef.current.delete(tag);
+      }
     }
 
     setTranslationState((prev) => {
@@ -942,12 +960,14 @@ export default function PromptComposer({
       suggestAbortRef.current = controller;
       const timeoutId = setTimeout(() => controller.abort(), SUGGEST_TIMEOUT_MS);
       const limit = Math.min(suggestionLimit, 20);
+      const isJapaneseQuery = JAPANESE_QUERY_PATTERN.test(query);
       const params = new URLSearchParams({ q: query, limit: String(limit) });
 
       const run = async () => {
         let responseText = "";
         try {
-          const response = await fetch(`${API_BASE_URL}/api/tags/dictionary?${params.toString()}`, {
+          const endpoint = isJapaneseQuery ? "/api/translate/persistent/search" : "/api/tags/dictionary";
+          const response = await fetch(`${API_BASE_URL}${endpoint}?${params.toString()}`, {
             cache: "no-store",
             signal: controller.signal
           });
@@ -966,23 +986,47 @@ export default function PromptComposer({
             setSuggestOpen(false);
             return;
           }
-          if (!payload || payload.ok !== true || !payload.data || !Array.isArray(payload.data.items)) {
+          if (!payload || payload.ok !== true || !payload.data) {
             setSuggestions([]);
             setSuggestOpen(false);
             return;
           }
           const results: TagSuggestion[] = [];
-          for (const item of payload.data.items as any[]) {
-            if (!item || typeof item.tag !== "string") continue;
-            const rawAliases = Array.isArray(item.aliases) ? (item.aliases as unknown[]) : [];
-            results.push({
-              tag: item.tag,
-              type: typeof item.type === "string" ? item.type : undefined,
-              count: typeof item.count === "number" ? item.count : undefined,
-              aliases: rawAliases.filter((alias): alias is string => typeof alias === "string")
-            });
+          if (isJapaneseQuery) {
+            if (!Array.isArray(payload.data.results)) {
+              setSuggestions([]);
+              setSuggestOpen(false);
+              return;
+            }
+            for (const item of payload.data.results as any[]) {
+              if (!item || typeof item.tag !== "string" || typeof item.ja !== "string") continue;
+              results.push({
+                tag: item.tag,
+                ja: item.ja,
+                observedCount: typeof item.observedCount === "number" ? item.observedCount : undefined,
+                source: "persistent"
+              });
+            }
+          } else {
+            if (!Array.isArray(payload.data.items)) {
+              setSuggestions([]);
+              setSuggestOpen(false);
+              return;
+            }
+            for (const item of payload.data.items as any[]) {
+              if (!item || typeof item.tag !== "string") continue;
+              const rawAliases = Array.isArray(item.aliases) ? (item.aliases as unknown[]) : [];
+              results.push({
+                tag: item.tag,
+                type: typeof item.type === "string" ? item.type : undefined,
+                count: typeof item.count === "number" ? item.count : undefined,
+                aliases: rawAliases.filter((alias): alias is string => typeof alias === "string"),
+                ja: typeof item.ja === "string" ? item.ja : undefined,
+                source: "dictionary"
+              });
+            }
+            markDictionaryTags(results.map((item) => item.tag));
           }
-          markDictionaryTags(results.map((item) => item.tag));
           if (!activeRef.current || requestId !== suggestRequestIdRef.current) return;
           setSuggestions(results);
           setSuggestOpen(results.length > 0);
@@ -1019,9 +1063,28 @@ export default function PromptComposer({
     });
     for (const tag of tags) {
       forceQueueRef.current.add(tag);
+      translateQueueRef.current.delete(tag);
       tagRequestIdRef.current.set(tag, requestId);
       lookupTagRequestIdRef.current.delete(tag);
-      inFlightRequests.delete(tag);
+    }
+  }, []);
+
+  const queueTranslateMissing = useCallback((tags: string[]) => {
+    if (tags.length === 0) return;
+    const pending = tags.filter((tag) => !inFlightRequests.has(tag));
+    if (pending.length === 0) return;
+    const now = Date.now();
+    setTranslationState((prev) => {
+      const next = new Map(prev);
+      for (const tag of pending) {
+        const existing = next.get(tag);
+        const lookupChecked = existing?.lookupChecked ?? true;
+        next.set(tag, { status: "pending", updatedAt: now, lookupChecked });
+      }
+      return next;
+    });
+    for (const tag of pending) {
+      translateQueueRef.current.add(tag);
     }
   }, []);
 
@@ -1152,6 +1215,7 @@ export default function PromptComposer({
       translateRequestIdRef.current = requestId;
       for (const tag of tags) {
         tagRequestIdRef.current.set(tag, requestId);
+        translateQueueRef.current.delete(tag);
       }
       if (force) {
         for (const tag of tags) {
@@ -1185,7 +1249,7 @@ export default function PromptComposer({
         };
 
         try {
-          const response = await fetch(`${API_BASE_URL}/api/ollama/translate-tags`, {
+          const response = await fetch(`${API_BASE_URL}/api/translate/tags`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ tags, ...(force ? { force: true } : {}) }),
@@ -1258,6 +1322,9 @@ export default function PromptComposer({
               inFlightRequests.delete(tag);
             }
           }
+          if (activeRef.current) {
+            setTranslateTick((prev) => prev + 1);
+          }
         }
       };
 
@@ -1294,12 +1361,17 @@ export default function PromptComposer({
     if (uniqueTokens.length === 0) return;
     const pendingTags = uniqueTokens.filter((tag) => {
       const entry = translationState.get(tag);
-      return entry?.status === "pending" && !inFlightRequests.has(tag);
+      if (!entry || entry.status !== "pending") return false;
+      if (inFlightRequests.has(tag)) return false;
+      if (forceQueueRef.current.has(tag)) return true;
+      return translateQueueRef.current.has(tag);
     });
     if (pendingTags.length === 0) return;
 
     const forceTags = pendingTags.filter((tag) => forceQueueRef.current.has(tag));
-    const normalTags = pendingTags.filter((tag) => !forceQueueRef.current.has(tag));
+    const normalTags = pendingTags.filter(
+      (tag) => !forceQueueRef.current.has(tag) && translateQueueRef.current.has(tag)
+    );
 
     for (const chunk of chunkArray(forceTags, TRANSLATE_BATCH_SIZE)) {
       startTranslationBatch(chunk, true);
@@ -1307,7 +1379,15 @@ export default function PromptComposer({
     for (const chunk of chunkArray(normalTags, TRANSLATE_BATCH_SIZE)) {
       startTranslationBatch(chunk, false);
     }
-  }, [persistentReady, startTranslationBatch, translationState, uniqueTokens]);
+  }, [persistentReady, startTranslationBatch, translationState, translateTick, uniqueTokens]);
+
+  const untranslatedTokens = useMemo(() => {
+    if (uniqueTokens.length === 0) return [];
+    return uniqueTokens.filter((tag) => {
+      const cached = translationCache.get(tag);
+      return !cached || !cached.ja.trim();
+    });
+  }, [translationState, uniqueTokens]);
 
   const updateTokens = (nextTokens: string[]) => {
     onChange(joinTokens(nextTokens));
@@ -1604,6 +1684,11 @@ export default function PromptComposer({
     updateTokens(next);
   };
 
+  const handleTranslateMissing = () => {
+    if (untranslatedTokens.length === 0) return;
+    queueTranslateMissing(untranslatedTokens);
+  };
+
   const handleRetranslateToken = (tag: string) => {
     queueForceTranslation([tag]);
   };
@@ -1796,6 +1881,14 @@ export default function PromptComposer({
           )}
           <button
             type="button"
+            onClick={handleTranslateMissing}
+            disabled={untranslatedTokens.length === 0}
+            className="rounded-md border border-slate-700 px-2 py-1 text-[11px] text-slate-300 transition hover:border-emerald-400/60 hover:text-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Translate all
+          </button>
+          <button
+            type="button"
             onClick={handleRetranslateAll}
             disabled={uniqueTokens.length === 0}
             className="rounded-md border border-slate-700 px-2 py-1 text-[11px] text-slate-300 transition hover:border-emerald-400/60 hover:text-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
@@ -1826,7 +1919,7 @@ export default function PromptComposer({
             }`}
           >
             {tokens.length === 0 && inputValue.length === 0 && (
-              <span className="text-xs text-slate-500">{placeholder ?? "Type and press Enter"}</span>
+              <span className="text-sm text-slate-500">{placeholder ?? "Type and press Enter"}</span>
             )}
             {groupedDisplayItems.map((entry) =>
               entry.kind === "header" ? (
@@ -1859,7 +1952,7 @@ export default function PromptComposer({
                 onBlur={() => {
                   setTimeout(() => setSuggestOpen(false), 120);
                 }}
-                className="w-full bg-transparent text-xs text-slate-100 focus:outline-none"
+                className="w-full bg-transparent text-sm text-slate-100 focus:outline-none"
               />
               {suggestOpen && suggestions.length > 0 && (
                 <div className="absolute z-30 mt-1 max-h-56 w-full overflow-auto rounded-md border border-slate-800 bg-slate-950 text-xs text-slate-200 shadow-lg">
@@ -1869,9 +1962,12 @@ export default function PromptComposer({
                       type="button"
                       onMouseDown={(event) => event.preventDefault()}
                       onClick={() => handleSuggestionClick(item.tag)}
-                      className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left transition hover:bg-slate-800"
+                      className="flex w-full items-start justify-between gap-2 px-3 py-2 text-left transition hover:bg-slate-800"
                     >
-                      <span className="truncate">{item.tag}</span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate">{item.tag}</span>
+                        {item.ja && <span className="block truncate text-[11px] text-slate-500">{item.ja}</span>}
+                      </span>
                       {typeof item.count === "number" && (
                         <span className="text-[11px] text-slate-500">{item.count.toLocaleString()}</span>
                       )}

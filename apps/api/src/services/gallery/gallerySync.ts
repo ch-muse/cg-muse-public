@@ -40,6 +40,7 @@ export type ComfyOutputImage = {
   filename: string;
   subfolder?: string | null;
   type?: string | null;
+  relPath?: string | null;
 };
 
 export type GallerySyncItem = {
@@ -47,6 +48,7 @@ export type GallerySyncItem = {
   comfyRunId: string;
   promptId: string | null;
   filename: string;
+  relPath: string | null;
   subfolder: string | null;
   fileType: string | null;
   width: number | null;
@@ -121,6 +123,7 @@ export const buildGalleryItemsFromRun = (run: GalleryRunSource, outputs: ComfyOu
     comfyRunId: run.id,
     promptId,
     filename: output.filename,
+    relPath: output.relPath ?? null,
     subfolder: output.subfolder ?? null,
     fileType: output.type ?? null,
     width,

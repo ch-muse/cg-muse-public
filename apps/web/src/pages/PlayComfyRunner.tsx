@@ -1,6 +1,7 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { useSearchParams } from "react-router-dom";
 import { API_BASE_URL } from "../lib/api.js";
+import ImageDropPaste from "../components/common/ImageDropPaste.js";
 import PromptComposer, { normalizeTokenKey } from "../components/prompt/PromptComposer.js";
 import TagDictionaryPanel from "../components/prompt/TagDictionaryPanel.js";
 import type { TagDictionary } from "../lib/tagDictionary.js";
@@ -157,6 +158,37 @@ const normalizeLoraFileKey = (value: string) => {
   const normalized = trimmed.replace(/\\/g, "/");
   const base = normalized.split("/").pop() ?? normalized;
   return base.trim().toLowerCase();
+};
+
+const isSafetensorsCkpt = (value?: string | null): value is string => {
+  if (!value) return false;
+  const trimmed = value.trim().toLowerCase();
+  return trimmed.endsWith(".safetensors");
+};
+
+const readImageSizeFromBlob = async (blob: Blob) => {
+  if (typeof createImageBitmap === "function") {
+    const bitmap = await createImageBitmap(blob);
+    const size = { width: bitmap.width, height: bitmap.height };
+    bitmap.close?.();
+    return size;
+  }
+
+  return new Promise<{ width: number; height: number } | null>((resolve) => {
+    const url = URL.createObjectURL(blob);
+    const image = new Image();
+    const cleanup = () => URL.revokeObjectURL(url);
+    image.onload = () => {
+      const size = { width: image.naturalWidth, height: image.naturalHeight };
+      cleanup();
+      resolve(size);
+    };
+    image.onerror = () => {
+      cleanup();
+      resolve(null);
+    };
+    image.src = url;
+  });
 };
 
 const splitPromptTokens = (value: string) =>
@@ -372,8 +404,6 @@ export default function PlayComfyRunnerPage() {
   const [preprocessor, setPreprocessor] = useState("");
   const [controlnetImageFile, setControlnetImageFile] = useState<File | null>(null);
   const [initImageFile, setInitImageFile] = useState<File | null>(null);
-  const [initImagePreviewUrl, setInitImagePreviewUrl] = useState<string | null>(null);
-  const initImageInputRef = useRef<HTMLInputElement | null>(null);
   const image2iDenoiseInitRef = useRef({ initialized: false, usedFallback: false });
   const [ksamplerOpen, setKsamplerOpen] = useState(false);
   const [ksamplerSteps, setKsamplerSteps] = useState("");
@@ -633,7 +663,7 @@ export default function PlayComfyRunnerPage() {
   }, [fetchOptions]);
 
   const fetchLoraLibrary = useCallback(async (): Promise<Lora[] | null> => {
-    if (loraLibraryInFlightRef.current) return;
+    if (loraLibraryInFlightRef.current) return null;
     loraLibraryInFlightRef.current = true;
     const requestId = loraLibraryRequestIdRef.current + 1;
     loraLibraryRequestIdRef.current = requestId;
@@ -651,7 +681,7 @@ export default function PlayComfyRunnerPage() {
       rawText = await response.text();
 
       if (!activeRef.current || requestId !== loraLibraryRequestIdRef.current) {
-        return;
+        return null;
       }
 
       if (!response.ok) {
@@ -676,7 +706,7 @@ export default function PlayComfyRunnerPage() {
       return nextLoras;
     } catch {
       if (!activeRef.current || requestId !== loraLibraryRequestIdRef.current) {
-        return;
+        return null;
       }
       return null;
     } finally {
@@ -736,7 +766,7 @@ export default function PlayComfyRunnerPage() {
         const widthValue = resolveNumberField(request, ["width", "empty_latent_width", "emptyLatentWidth"]);
         const heightValue = resolveNumberField(request, ["height", "empty_latent_height", "emptyLatentHeight"]);
 
-        if (ckpt) setCkptName(ckpt);
+        if (isSafetensorsCkpt(ckpt)) setCkptName(ckpt);
         setPositive(positiveValue);
         setNegative(negativeValue);
         if (widthValue !== null) setWidth(String(Math.trunc(widthValue)));
@@ -805,7 +835,10 @@ export default function PlayComfyRunnerPage() {
         const viewUrl = resolveGalleryItemViewUrl(item);
 
         if (!rehydrateRunId) {
-          if (item.ckpt_name) setCkptName(item.ckpt_name);
+          const ckptName = item.ckpt_name?.trim();
+          if (isSafetensorsCkpt(ckptName)) {
+            setCkptName(ckptName);
+          }
           setPositive(item.positive ?? "");
           setNegative(item.negative ?? "");
           if (typeof item.width === "number") setWidth(String(Math.trunc(item.width)));
@@ -821,6 +854,17 @@ export default function PlayComfyRunnerPage() {
             throw new Error(`image HTTP ${imageResponse.status}`);
           }
           const blob = await imageResponse.blob();
+          const imageSize = await readImageSizeFromBlob(blob);
+          if (
+            imageSize &&
+            !rehydrateRunId &&
+            activeRef.current &&
+            requestId === rehydrateGalleryRequestIdRef.current &&
+            !controller.signal.aborted
+          ) {
+            setWidth(String(Math.trunc(imageSize.width)));
+            setHeight(String(Math.trunc(imageSize.height)));
+          }
           const fallbackName = `gallery_${item.id}.png`;
           const fileName = item.filename && item.filename.trim().length > 0 ? item.filename : fallbackName;
           const fileType = blob.type || "image/png";
@@ -848,33 +892,24 @@ export default function PlayComfyRunnerPage() {
 
   useEffect(() => {
     if (!ckptName && options.ckptNames.length > 0) {
-      setCkptName(options.ckptNames[0]);
+      const nextCkpt = options.ckptNames[0];
+      if (nextCkpt) setCkptName(nextCkpt);
     }
   }, [ckptName, options.ckptNames]);
 
   useEffect(() => {
     if (!controlnetModel && options.controlnetModelNames.length > 0) {
-      setControlnetModel(options.controlnetModelNames[0]);
+      const nextModel = options.controlnetModelNames[0];
+      if (nextModel) setControlnetModel(nextModel);
     }
   }, [controlnetModel, options.controlnetModelNames]);
 
   useEffect(() => {
     if (!preprocessor && options.preprocessorNames.length > 0) {
-      setPreprocessor(options.preprocessorNames[0]);
+      const nextPreprocessor = options.preprocessorNames[0];
+      if (nextPreprocessor) setPreprocessor(nextPreprocessor);
     }
   }, [preprocessor, options.preprocessorNames]);
-
-  useEffect(() => {
-    if (!initImageFile) {
-      setInitImagePreviewUrl(null);
-      return;
-    }
-    const url = URL.createObjectURL(initImageFile);
-    setInitImagePreviewUrl(url);
-    return () => {
-      URL.revokeObjectURL(url);
-    };
-  }, [initImageFile]);
 
   useEffect(() => {
     if (!initImageFile) {
@@ -961,13 +996,6 @@ export default function PlayComfyRunnerPage() {
   const handleSwapSize = () => {
     setWidth(height);
     setHeight(width);
-  };
-
-  const handleClearInitImage = () => {
-    setInitImageFile(null);
-    if (initImageInputRef.current) {
-      initImageInputRef.current.value = "";
-    }
   };
 
   const handleAddLora = () => {
@@ -1524,40 +1552,19 @@ export default function PlayComfyRunnerPage() {
               </div>
             )}
             <div className="space-y-2 md:col-span-2">
-              <div className="flex items-center justify-between">
-                <label className="text-sm text-slate-300">Init Image (i2i)</label>
-                {initImageFile && (
-                  <button
-                    type="button"
-                    onClick={handleClearInitImage}
-                    className="rounded-md border border-slate-700 px-3 py-1 text-xs text-slate-200 transition hover:border-emerald-400/60 hover:text-white"
-                  >
-                    Clear
-                  </button>
-                )}
-              </div>
-              <input
-                ref={initImageInputRef}
-                type="file"
-                accept="image/*"
-                onChange={(event) => setInitImageFile(event.target.files?.[0] ?? null)}
-                className="w-full text-sm text-slate-200 file:mr-3 file:rounded-md file:border file:border-slate-700 file:bg-slate-900 file:px-3 file:py-2 file:text-xs file:text-slate-200 file:transition hover:file:border-emerald-400/60 hover:file:text-white"
+              <ImageDropPaste
+                label="Init Image (i2i)"
+                valueFile={initImageFile}
+                onChangeFile={setInitImageFile}
+                helpText="未選択の場合は t2i として実行されます。"
               />
-              {initImagePreviewUrl ? (
-                <div className="mt-2 inline-flex max-w-xs overflow-hidden rounded-md border border-slate-800 bg-slate-900/60 p-2">
-                  <img src={initImagePreviewUrl} alt="init preview" className="h-24 w-auto rounded object-contain" />
-                </div>
-              ) : (
-                <p className="text-xs text-slate-500">未選択の場合は t2i として実行されます。</p>
-              )}
-              {initImageFile && <p className="text-xs text-slate-400">Selected: {initImageFile.name}</p>}
             </div>
           </div>
         </section>
 
         <section className="rounded-2xl border border-slate-800 bg-slate-950/60 p-6 shadow-lg shadow-black/40">
           <h2 className="text-lg font-semibold">Prompts</h2>
-          <div className="mt-4 grid gap-4 md:grid-cols-2">
+          <div className="mt-4 grid gap-4">
             <PromptComposer
               label="Positive"
               target="positive"
@@ -1750,16 +1757,11 @@ export default function PlayComfyRunnerPage() {
                   />
                 </div>
                 <div className="space-y-2">
-                  <label className="text-sm text-slate-300">Image</label>
-                  <input
-                    type="file"
-                    accept="image/*"
-                    onChange={(event) => setControlnetImageFile(event.target.files?.[0] ?? null)}
-                    className="w-full text-sm text-slate-200 file:mr-3 file:rounded-md file:border file:border-slate-700 file:bg-slate-900 file:px-3 file:py-2 file:text-xs file:text-slate-200 file:transition hover:file:border-emerald-400/60 hover:file:text-white"
+                  <ImageDropPaste
+                    label="Image"
+                    valueFile={controlnetImageFile}
+                    onChangeFile={setControlnetImageFile}
                   />
-                  {controlnetImageFile && (
-                    <p className="text-xs text-slate-400">Selected: {controlnetImageFile.name}</p>
-                  )}
                   {!controlnetImageFile && defaults?.controlnetDefaults.imageName && (
                     <p className="text-xs text-slate-500">Template image: {defaults.controlnetDefaults.imageName}</p>
                   )}

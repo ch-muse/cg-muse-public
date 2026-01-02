@@ -1,0 +1,49 @@
+{
+  "workflowId": "base_image2i",
+  "workflowPath": "comfy/workflows/base_image2i.json",
+  "params": {
+    "ckpt": { "type": "string", "default": "waiNSFWIllustrious_v150.safetensors" },
+    "outputSize": { "type": "size", "default": { "width": 1216, "height": 1728 } },
+    "initImage": { "type": "image", "default": null },
+    "positive": { "type": "string", "default": "" },
+    "negative": { "type": "string", "default": "" },
+    "loras": { "type": "loraList", "default": [] },
+    "controlnetEnabled": { "type": "boolean", "default": false },
+    "controlnetPreprocessEnabled": { "type": "boolean", "default": false },
+    "controlnetModel": { "type": "string", "default": "" },
+    "preprocessModel": { "type": "string", "default": "" },
+    "controlnetStrength": { "type": "number", "default": 1 },
+    "steps": { "type": "number", "default": 30 },
+    "cfg": { "type": "number", "default": 7 },
+    "sampler_name": { "type": "string", "default": "euler_ancestral" },
+    "seed": { "type": "seed", "default": { "value": -1, "randomize": true } },
+    "denoise": { "type": "number", "default": 0.75 },
+    "controlnetImage": { "type": "image", "default": null }
+  },
+  "selectors": {
+    "ckpt": [{ "nodeId": "122", "inputKey": "ckpt_name" }],
+    "outputSize": [
+      { "nodeId": "122", "inputKey": "empty_latent_width", "paramPath": "width" },
+      { "nodeId": "122", "inputKey": "empty_latent_height", "paramPath": "height" }
+    ],
+    "initImage": [{ "nodeId": "117", "inputKey": "image" }],
+    "positive": [{ "nodeId": "122", "inputKey": "positive" }],
+    "negative": [{ "nodeId": "122", "inputKey": "negative" }],
+    "loras": [{ "nodeId": "92", "inputKey": "lora_count" }],
+    "controlnetEnabled": [{ "nodeId": "104", "inputKey": "strength" }],
+    "controlnetPreprocessEnabled": [{ "nodeId": "112", "inputKey": "preprocessor" }],
+    "controlnetModel": [{ "nodeId": "83", "inputKey": "control_net_name" }],
+    "preprocessModel": [{ "nodeId": "112", "inputKey": "preprocessor" }],
+    "controlnetStrength": [{ "nodeId": "104", "inputKey": "strength" }],
+    "steps": [{ "nodeId": "3", "inputKey": "steps" }],
+    "cfg": [{ "nodeId": "3", "inputKey": "cfg" }],
+    "sampler_name": [{ "nodeId": "3", "inputKey": "sampler_name" }],
+    "seed": [{ "nodeId": "3", "inputKey": "seed" }],
+    "denoise": [{ "nodeId": "3", "inputKey": "denoise" }],
+    "controlnetImage": [{ "nodeId": "114", "inputKey": "image" }]
+  },
+  "asserts": [
+    { "type": "nodeExists", "nodeId": "118", "message": "image2i requires node 118" },
+    { "type": "nodeExists", "nodeId": "123", "message": "image2i requires node 123" }
+  ]
+}

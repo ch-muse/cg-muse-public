@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type SyntheticEvent } from "react";
+import * as Dialog from "@radix-ui/react-dialog";
 import { Link } from "react-router-dom";
 import { api, ApiClientError, API_BASE_URL } from "../lib/api.js";
+import PromptTextarea from "../components/prompt/PromptTextarea.js";
 import type { GalleryItem } from "../types.js";
 
 type FilterState = {
@@ -126,10 +128,36 @@ const parseOptionalNumber = (value: string) => {
   return Math.trunc(parsed);
 };
 
+const buildInitialEditForm = (item: GalleryItem): ManualEditState => ({
+  ckpt: item.manual_ckpt_name ?? item.ckpt_name ?? null,
+  loras: item.manual_lora_names
+    ? item.manual_lora_names.join(", ")
+    : item.lora_names
+      ? item.lora_names.join(", ")
+      : null,
+  positive: item.manual_positive ?? item.positive ?? null,
+  negative: item.manual_negative ?? item.negative ?? null,
+  width:
+    item.manual_width !== null && item.manual_width !== undefined
+      ? String(item.manual_width)
+      : item.width !== null && item.width !== undefined
+        ? String(item.width)
+        : null,
+  height:
+    item.manual_height !== null && item.manual_height !== undefined
+      ? String(item.manual_height)
+      : item.height !== null && item.height !== undefined
+        ? String(item.height)
+        : null,
+  tags: item.manual_tags ? item.manual_tags.join(", ") : null,
+  notes: item.manual_notes ?? null
+});
+
 export default function GalleryPage() {
   const [filters, setFilters] = useState<FilterState>(defaultFilters);
   const [appliedFilters, setAppliedFilters] = useState<FilterState>(defaultFilters);
   const [items, setItems] = useState<GalleryItem[]>([]);
+  const [imageSizes, setImageSizes] = useState<Record<string, { width: number; height: number }>>({});
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [phase, setPhase] = useState<LoadPhase>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -254,16 +282,7 @@ export default function GalleryPage() {
       setDeleteBusy(false);
       return;
     }
-    setEditForm({
-      ckpt: selected.manual_ckpt_name ?? null,
-      loras: selected.manual_lora_names ? selected.manual_lora_names.join(", ") : null,
-      positive: selected.manual_positive ?? null,
-      negative: selected.manual_negative ?? null,
-      width: selected.manual_width !== null && selected.manual_width !== undefined ? String(selected.manual_width) : null,
-      height: selected.manual_height !== null && selected.manual_height !== undefined ? String(selected.manual_height) : null,
-      tags: selected.manual_tags ? selected.manual_tags.join(", ") : null,
-      notes: selected.manual_notes ?? null
-    });
+    setEditForm(buildInitialEditForm(selected));
     setEditError(null);
     setEditMessage(null);
   }, [selected?.id]);
@@ -280,6 +299,21 @@ export default function GalleryPage() {
   const handleLoadMore = () => {
     fetchItems("append", nextCursor);
   };
+
+  const handleImageLoad = useCallback(
+    (itemId: string) => (event: SyntheticEvent<HTMLImageElement>) => {
+      const { naturalWidth, naturalHeight } = event.currentTarget;
+      if (!naturalWidth || !naturalHeight) return;
+      setImageSizes((prev) => {
+        const existing = prev[itemId];
+        if (existing && existing.width === naturalWidth && existing.height === naturalHeight) {
+          return prev;
+        }
+        return { ...prev, [itemId]: { width: naturalWidth, height: naturalHeight } };
+      });
+    },
+    []
+  );
 
   const applyItemUpdate = useCallback((item: GalleryItem) => {
     setItems((prev) => prev.map((entry) => (entry.id === item.id ? item : entry)));
@@ -352,15 +386,43 @@ export default function GalleryPage() {
     const nextLoras = parseCommaInput(editForm.loras);
     const nextTags = parseCommaInput(editForm.tags);
 
+    let nextManualCkptName = editForm.ckpt === null ? null : editForm.ckpt.trim();
+    let nextManualPositive = editForm.positive === null ? null : editForm.positive;
+    let nextManualNegative = editForm.negative === null ? null : editForm.negative;
+    let nextManualLoraNames = nextLoras;
+    let nextManualTags = nextTags;
+    let nextManualWidth = widthValue;
+    let nextManualHeight = heightValue;
+    let nextManualNotes = editForm.notes === null ? null : editForm.notes;
+
+    if (selected.manual_ckpt_name == null && nextManualCkptName === (selected.ckpt_name ?? null)) {
+      nextManualCkptName = null;
+    }
+    if (selected.manual_positive == null && nextManualPositive === (selected.positive ?? null)) {
+      nextManualPositive = null;
+    }
+    if (selected.manual_negative == null && nextManualNegative === (selected.negative ?? null)) {
+      nextManualNegative = null;
+    }
+    if (selected.manual_lora_names == null && areArraysEqual(nextManualLoraNames, selected.lora_names ?? null)) {
+      nextManualLoraNames = null;
+    }
+    if (selected.manual_width == null && nextManualWidth === (selected.width ?? null)) {
+      nextManualWidth = null;
+    }
+    if (selected.manual_height == null && nextManualHeight === (selected.height ?? null)) {
+      nextManualHeight = null;
+    }
+
     const nextManual = {
-      manualCkptName: editForm.ckpt === null ? null : editForm.ckpt.trim(),
-      manualPositive: editForm.positive === null ? null : editForm.positive,
-      manualNegative: editForm.negative === null ? null : editForm.negative,
-      manualLoraNames: nextLoras,
-      manualTags: nextTags,
-      manualWidth: widthValue,
-      manualHeight: heightValue,
-      manualNotes: editForm.notes === null ? null : editForm.notes
+      manualCkptName: nextManualCkptName,
+      manualPositive: nextManualPositive,
+      manualNegative: nextManualNegative,
+      manualLoraNames: nextManualLoraNames,
+      manualTags: nextManualTags,
+      manualWidth: nextManualWidth,
+      manualHeight: nextManualHeight,
+      manualNotes: nextManualNotes
     };
 
     const payload: Record<string, unknown> = {};
@@ -413,22 +475,7 @@ export default function GalleryPage() {
       const result = await api.updateGalleryItem(selected.id, payload, { signal: controller.signal });
       if (!activeRef.current || requestId !== editRequestIdRef.current) return;
       applyItemUpdate(result.item);
-      setEditForm({
-        ckpt: result.item.manual_ckpt_name ?? null,
-        loras: result.item.manual_lora_names ? result.item.manual_lora_names.join(", ") : null,
-        positive: result.item.manual_positive ?? null,
-        negative: result.item.manual_negative ?? null,
-        width:
-          result.item.manual_width !== null && result.item.manual_width !== undefined
-            ? String(result.item.manual_width)
-            : null,
-        height:
-          result.item.manual_height !== null && result.item.manual_height !== undefined
-            ? String(result.item.manual_height)
-            : null,
-        tags: result.item.manual_tags ? result.item.manual_tags.join(", ") : null,
-        notes: result.item.manual_notes ?? null
-      });
+      setEditForm(buildInitialEditForm(result.item));
       setEditMessage("保存しました。");
     } catch (err) {
       if (!activeRef.current || requestId !== editRequestIdRef.current) return;
@@ -531,6 +578,7 @@ export default function GalleryPage() {
 
   const isLoading = phase === "loading";
   const isLoadingMore = phase === "loading-more";
+  const selectedImageSize = selected ? imageSizes[selected.id] : null;
   const selectedMetaExtracted =
     selected && selected.meta_extracted && typeof selected.meta_extracted === "object"
       ? (selected.meta_extracted as Record<string, unknown>)
@@ -679,7 +727,8 @@ export default function GalleryPage() {
           <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
             {items.map((item) => {
               const viewUrl = resolveViewUrl(item);
-              const sizeText = formatSize(item.width, item.height);
+              const imageSize = imageSizes[item.id];
+              const sizeText = formatSize(imageSize?.width ?? item.width, imageSize?.height ?? item.height);
               const busy = favoriteBusy.has(item.id);
               return (
                 <div key={item.id} className="overflow-hidden rounded-2xl border border-slate-800 bg-slate-950/60 shadow-lg shadow-black/30">
@@ -690,6 +739,7 @@ export default function GalleryPage() {
                         alt={item.filename}
                         loading="lazy"
                         decoding="async"
+                        onLoad={handleImageLoad(item.id)}
                         className="h-48 w-full object-cover"
                       />
                     ) : (
@@ -753,70 +803,78 @@ export default function GalleryPage() {
         )}
       </section>
 
-      {selected && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 px-6 py-10"
-          onClick={() => setSelected(null)}
-        >
-          <div
-            className="max-h-full w-full max-w-5xl overflow-hidden rounded-2xl border border-slate-800 bg-slate-950"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <div className="flex items-center justify-between border-b border-slate-800 px-5 py-3">
-              <div>
-                <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Gallery Item</p>
-                <h2 className="text-lg font-semibold text-slate-100">{selected.ckpt_name || "Untitled"}</h2>
-              </div>
-              <button
-                type="button"
-                onClick={() => setSelected(null)}
-                className="rounded-md border border-slate-700 px-3 py-1 text-xs text-slate-200 hover:border-slate-400"
-              >
-                Close
-              </button>
-            </div>
-            <div className="grid gap-4 p-5 md:grid-cols-[2fr_1fr]">
-              <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-3">
-                <img
-                  src={resolveViewUrl(selected)}
-                  alt={selected.filename}
-                  className="max-h-[70vh] w-full object-contain"
-                />
-              </div>
-              <div className="space-y-4 text-sm text-slate-200 md:max-h-[70vh] md:overflow-y-auto md:pr-2">
-                <div className="space-y-1">
-                  <div className="text-xs uppercase tracking-[0.2em] text-slate-500">Meta</div>
-                  <div>Created: {formatDate(selected.created_at)}</div>
-                  <div>Size: {formatSize(selected.width, selected.height)}</div>
-                  <div>Prompt ID: {selected.prompt_id || "-"}</div>
-                  {selected.source_type === "folder" && <div>Path: {selected.rel_path ?? "-"}</div>}
-                  {selected.lora_names && selected.lora_names.length > 0 && (
-                    <div>LoRA: {selected.lora_names.join(", ")}</div>
-                  )}
-                  {selected.needs_review && <div className="text-amber-300">Needs review</div>}
-                </div>
-
-                <div className="space-y-1">
-                  <div className="text-xs uppercase tracking-[0.2em] text-slate-500">Extracted</div>
-                  <div>Source: {extractedSource ?? "-"}</div>
-                  {extractedErrors.length > 0 && (
-                    <div className="text-xs text-rose-200">Parse errors: {extractedErrors.join(", ")}</div>
-                  )}
-                  <div className="text-xs text-slate-400">
-                    CKPT: {selected.extracted_ckpt_name ?? "-"}
+      <Dialog.Root
+        open={Boolean(selected)}
+        onOpenChange={(open) => {
+          if (!open) setSelected(null);
+        }}
+      >
+        {selected && (
+          <Dialog.Portal>
+            <Dialog.Overlay className="fixed inset-0 z-50 bg-slate-950/80" />
+            <div className="fixed inset-0 z-50 flex items-center justify-center px-6 py-10">
+              <Dialog.Content className="max-h-full w-full max-w-5xl overflow-hidden rounded-2xl border border-slate-800 bg-slate-950 focus:outline-none">
+                <div className="flex items-center justify-between border-b border-slate-800 px-5 py-3">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Gallery Item</p>
+                    <Dialog.Title asChild>
+                      <h2 className="text-lg font-semibold text-slate-100">{selected.ckpt_name || "Untitled"}</h2>
+                    </Dialog.Title>
                   </div>
-                  <div className="text-xs text-slate-400">
-                    Size: {formatSize(selected.extracted_width, selected.extracted_height)}
+                  <Dialog.Close asChild>
+                    <button
+                      type="button"
+                      className="rounded-md border border-slate-700 px-3 py-1 text-xs text-slate-200 hover:border-slate-400"
+                    >
+                      Close
+                    </button>
+                  </Dialog.Close>
+                </div>
+                <div className="grid gap-4 p-5 md:grid-cols-[2fr_1fr]">
+                  <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-3">
+                    <img
+                      src={resolveViewUrl(selected)}
+                      alt={selected.filename}
+                      onLoad={handleImageLoad(selected.id)}
+                      className="max-h-[70vh] w-full object-contain"
+                    />
                   </div>
-                </div>
+                  <div className="space-y-4 text-sm text-slate-200 md:max-h-[70vh] md:overflow-y-auto md:pr-2">
+                    <div className="space-y-1">
+                      <div className="text-xs uppercase tracking-[0.2em] text-slate-500">Meta</div>
+                      <div>Created: {formatDate(selected.created_at)}</div>
+                      <div>
+                        Size: {formatSize(selectedImageSize?.width ?? selected.width, selectedImageSize?.height ?? selected.height)}
+                      </div>
+                      <div>Prompt ID: {selected.prompt_id || "-"}</div>
+                      {selected.source_type === "folder" && <div>Path: {selected.rel_path ?? "-"}</div>}
+                      {selected.lora_names && selected.lora_names.length > 0 && (
+                        <div>LoRA: {selected.lora_names.join(", ")}</div>
+                      )}
+                      {selected.needs_review && <div className="text-amber-300">Needs review</div>}
+                    </div>
 
-                <div className="space-y-1">
-                  <div className="text-xs uppercase tracking-[0.2em] text-slate-500">Prompt (Effective)</div>
-                  <div className="text-xs text-slate-300">Positive: {truncateText(selected.positive)}</div>
-                  <div className="text-xs text-slate-300">Negative: {truncateText(selected.negative)}</div>
-                </div>
+                    <div className="space-y-1">
+                      <div className="text-xs uppercase tracking-[0.2em] text-slate-500">Extracted</div>
+                      <div>Source: {extractedSource ?? "-"}</div>
+                      {extractedErrors.length > 0 && (
+                        <div className="text-xs text-rose-200">Parse errors: {extractedErrors.join(", ")}</div>
+                      )}
+                      <div className="text-xs text-slate-400">
+                        CKPT: {selected.extracted_ckpt_name ?? "-"}
+                      </div>
+                      <div className="text-xs text-slate-400">
+                        Size: {formatSize(selected.extracted_width, selected.extracted_height)}
+                      </div>
+                    </div>
 
-                {editForm ? (
+                    <div className="space-y-1">
+                      <div className="text-xs uppercase tracking-[0.2em] text-slate-500">Prompt (Effective)</div>
+                      <div className="text-xs text-slate-300">Positive: {truncateText(selected.positive)}</div>
+                      <div className="text-xs text-slate-300">Negative: {truncateText(selected.negative)}</div>
+                    </div>
+
+                    {editForm ? (
                   <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-3">
                     <div className="flex items-center justify-between">
                       <div className="text-xs uppercase tracking-[0.2em] text-slate-500">Manual Overrides</div>
@@ -931,11 +989,9 @@ export default function GalleryPage() {
                             Reset
                           </button>
                         </div>
-                        <textarea
+                        <PromptTextarea
                           value={editForm.positive ?? ""}
-                          onChange={(event) =>
-                            setEditForm((prev) => (prev ? { ...prev, positive: event.target.value } : prev))
-                          }
+                          onChange={(value) => setEditForm((prev) => (prev ? { ...prev, positive: value } : prev))}
                           placeholder={selected.extracted_positive ?? ""}
                           rows={3}
                           className="w-full resize-none rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-100 focus:border-emerald-400 focus:outline-none"
@@ -956,11 +1012,9 @@ export default function GalleryPage() {
                             Reset
                           </button>
                         </div>
-                        <textarea
+                        <PromptTextarea
                           value={editForm.negative ?? ""}
-                          onChange={(event) =>
-                            setEditForm((prev) => (prev ? { ...prev, negative: event.target.value } : prev))
-                          }
+                          onChange={(value) => setEditForm((prev) => (prev ? { ...prev, negative: value } : prev))}
                           placeholder={selected.extracted_negative ?? ""}
                           rows={3}
                           className="w-full resize-none rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-100 focus:border-emerald-400 focus:outline-none"
@@ -1085,9 +1139,11 @@ export default function GalleryPage() {
                 </div>
               </div>
             </div>
-          </div>
-        </div>
-      )}
+            </Dialog.Content>
+            </div>
+          </Dialog.Portal>
+        )}
+      </Dialog.Root>
     </div>
   );
 }

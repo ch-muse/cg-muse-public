@@ -174,6 +174,7 @@ export type GalleryUpsertItem = {
   comfyRunId: string;
   promptId: string | null;
   filename: string;
+  relPath: string | null;
   subfolder: string | null;
   fileType: string | null;
   width: number | null;
@@ -219,6 +220,7 @@ export const upsertGalleryItems = async (db: Queryable, items: GalleryUpsertItem
     "comfy_run_id",
     "prompt_id",
     "filename",
+    "rel_path",
     "subfolder",
     "file_type",
     "width",
@@ -240,6 +242,7 @@ export const upsertGalleryItems = async (db: Queryable, items: GalleryUpsertItem
       item.comfyRunId,
       item.promptId,
       item.filename,
+      item.relPath,
       item.subfolder,
       item.fileType,
       item.width,
@@ -262,6 +265,7 @@ export const upsertGalleryItems = async (db: Queryable, items: GalleryUpsertItem
     ON CONFLICT (source_type, comfy_run_id, filename, COALESCE(subfolder, ''), COALESCE(file_type, ''))
     DO UPDATE SET
       prompt_id = COALESCE(EXCLUDED.prompt_id, gallery_items.prompt_id),
+      rel_path = COALESCE(EXCLUDED.rel_path, gallery_items.rel_path),
       width = EXCLUDED.width,
       height = EXCLUDED.height,
       ckpt_name = EXCLUDED.ckpt_name,
